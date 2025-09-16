@@ -6,6 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)
 ![ML](https://img.shields.io/badge/machine--learning-advanced-orange?style=flat-square)
 ![Finance](https://img.shields.io/badge/domain-finance-gold?style=flat-square)
+![Development](https://img.shields.io/badge/development-active-important?style=flat-square)
 
 ---
 
@@ -20,7 +21,7 @@ AlphaFusion fuses statistical, classical ML, and deep-learning models into a mod
 - **Signal & strategy detectors:** Breakout, Mean-Reversion, Fibonacci Pullbacks, Swing Trading, Scalping, Pairs Trading  
 - **Ensemble & stacking:** Error-weighted ensembles, OOF meta-learner (ridge)  
 - **Backtesting:** Equity curve, Sharpe ratio, max drawdown, fee & slippage modeling  
-- **UX:** Rich CLI (progress bars, tables, epoch logs) and structured outputs
+- **UX:** Rich CLI (progress bars, tables, epoch logs) and structured outputs  
 
 ---
 
@@ -36,7 +37,7 @@ AlphaFusion fuses statistical, classical ML, and deep-learning models into a mod
 - ✅ Indicators & strategy detectors implemented  
 - ✅ Backtesting and ensemble stacking available  
 - 🔄 Expanding ensemble weighting & meta-learning  
-- 🔮 Planned: API, dashboard, real-time ingestion & monitoring
+- 🔮 Planned: API, dashboard, real-time ingestion & monitoring  
 
 ---
 
@@ -46,19 +47,24 @@ AlphaFusion fuses statistical, classical ML, and deep-learning models into a mod
     python -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
 
-    # Example usage (adapt to your CLI filename)
-    python alphafusion.py predict --ticker AAPL --timeframe 1d --model ensemble
+    # Get forecast
+    python alphafusion.py --ticker AAPL --timeframe 1d 
+    
+    # See command line arguements to tune the engine
+    python alphafusion.py --help
 
 ---
 
-## 🔒 Privacy & Usage
-AlphaFusion is **private and proprietary**.  
+## 🔒 Privacy, Usage & Development
+AlphaFusion is **confidential, proprietary, and under active development**.  
+Unauthorized copying, distribution, or use of the code is strictly prohibited.  
+
 For collaboration, demos, or inquiries, please open an issue or contact the repo owner.
 
 ---
 
 ## ✉️ Contact
-Open an issue on this repository for feature requests, bug reports, or collaboration opportunities.
+Open an issue on this repository for feature requests, bug reports, or collaboration opportunities.  
 
 ---
 
