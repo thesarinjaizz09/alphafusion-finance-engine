@@ -1,0 +1,44 @@
+# Core
+numpy
+pandas
+scikit-learn
+scipy
+
+# Deep Learning
+tensorflow
+# or torch==2.0.1 if you prefer PyTorch instead of TF (comment one out)
+
+# Gradient Boosting
+xgboost
+lightgbm
+
+# Time Series
+statsmodels
+prophet
+
+# Technical Indicators
+ta
+
+# Optimization
+optuna
+
+# Visualization
+matplotlib
+seaborn
+plotly
+
+# Backtesting & Financial Tools
+backtrader
+quantstats
+
+# Explainability
+shap
+
+# Data Fetching
+yfinance
+requests
+
+# Utils
+tqdm
+joblib
+rich
