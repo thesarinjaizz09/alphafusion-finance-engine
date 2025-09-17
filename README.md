@@ -1,7 +1,7 @@
 # ⚡ AlphaFusion
 
 > **AI-Powered Multi-Model Stock Forecasting & Trading Intelligence**
-> *Next-generation financial analytics with modular, explainable, and production-ready AI.*
+> **Next-generation financial analytics with modular, explainable, and production-ready AI.**
 
 ![Status](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)
