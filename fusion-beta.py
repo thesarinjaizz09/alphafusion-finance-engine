@@ -18,20 +18,46 @@ Notes:
 from __future__ import annotations
 import os
 import gc
+import sys
 import json
 import math
+import time
 import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, List, Optional
-
+import contextlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import Manager, Queue
+from tqdm import tqdm
+import threading
+
+import warnings
+
+# statsmodels convergence exception (optional — only import if available)
+try:
+    # newer statsmodels exposes ConvergenceWarning here
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning as SMConvergenceWarning
+except Exception:
+    SMConvergenceWarning = None
+
+# Quiet noisy warnings from statsmodels during SARIMAX parameter search;
+# keep other warnings visible. Adjust if you want to see them.
+warnings.filterwarnings("ignore", message="A date index has been provided, but it has no associated frequency information")
+if SMConvergenceWarning is not None:
+    warnings.filterwarnings("ignore", category=SMConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 
 # Rich UI
 try:
     from rich import print as rprint
+    from rich.live import Live
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
@@ -77,13 +103,18 @@ except Exception:
     xgb = None
 
 # TensorFlow/Keras (optional)
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential, Model
-    from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Conv1D, BatchNormalization, Attention
-    from tensorflow.keras.callbacks import EarlyStopping, Callback
-except Exception:
-    tf = None
+with contextlib.redirect_stdout(open(os.devnull, 'w')), \
+     contextlib.redirect_stderr(open(os.devnull, 'w')):
+    try:
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+        import tensorflow as tf
+        tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+        from tensorflow.keras.models import Sequential, Model
+        from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Conv1D, BatchNormalization, Attention
+        from tensorflow.keras import backend as K
+        from tensorflow.keras.callbacks import EarlyStopping, Callback
+    except Exception:
+        tf = None
     
 try:
     import lightgbm as lgb
@@ -105,22 +136,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("StockForecaster")
 
-import warnings
 
-# statsmodels convergence exception (optional — only import if available)
-try:
-    # newer statsmodels exposes ConvergenceWarning here
-    from statsmodels.tools.sm_exceptions import ConvergenceWarning as SMConvergenceWarning
-except Exception:
-    SMConvergenceWarning = None
-
-# Quiet noisy warnings from statsmodels during SARIMAX parameter search;
-# keep other warnings visible. Adjust if you want to see them.
-warnings.filterwarnings("ignore", message="A date index has been provided, but it has no associated frequency information")
-if SMConvergenceWarning is not None:
-    warnings.filterwarnings("ignore", category=SMConvergenceWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
-warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 
@@ -156,6 +172,14 @@ PERIOD_FOR_INTERVAL = {
     "1d": ("5y", "1d"),
 }
 
+def make_progress_table(progress_bars):
+    table = Table.grid(expand=True)
+    table.add_column(justify="left", ratio=1)
+    for target, bar in progress_bars.items():
+        # Capture current state of tqdm bar
+        bar_str = str(bar)
+        table.add_row(bar_str)
+    return Panel(table, title="Forecast Progress", border_style="cyan")
 
 # -------------------------
 # Datetime sanitizers
@@ -517,7 +541,7 @@ def sarimax_small_grid_forecast(train_series: pd.Series, val_horizon: int, exog:
         except Exception:
             fc = np.repeat(float(train_series.iloc[-1]), val_horizon)
 
-    return np.array(fc, dtype=float), best_model.params if hasattr(best_model, "params") else None
+    return np.array(fc, dtype=float), best_model if best_model else None
 
 def prophet_forecast(train_df: pd.Series, val_horizon: int, freq: str = 'D'):
     if Prophet is None:
@@ -685,57 +709,32 @@ def train_random_forest_v51(X_train, y_train, X_val=None, params: dict = None):
     preds_val = model.predict(X_val) if X_val is not None else None
     return preds_val, model
 
-def train_lightgbm_v51(X_train, y_train, X_val=None, params: dict = None, quantile=None):
+def train_lightgbm_v51(X_train, y_train, X_val=None, y_val=None, params: dict = None, quantile=None):
     if lgb is None:
         raise RuntimeError("LightGBM not installed")
     params = params or {}
     train_data = lgb.Dataset(X_train, label=y_train)
-    val_data = lgb.Dataset(X_val, label=y_train[-len(X_val):]) if X_val is not None else None
+    val_data = lgb.Dataset(X_val, label=y_val) if (X_val is not None and y_val is not None) else None
     params = {**params, "objective": "quantile" if quantile else "regression"}
-    if quantile: params["alpha"] = quantile
+    if quantile:
+        params["alpha"] = quantile
+
+
+    # set threads safely if not provided
+    params.setdefault("num_threads", int(os.environ.get("OMP_NUM_THREADS", 1)))
+
 
     booster = lgb.train(
-        params,
-        train_data,
-        num_boost_round=int(params.get("n_estimators", 500)),
-        valid_sets=[val_data] if val_data else None,
-        verbose_eval=False,
+    params,
+    train_data,
+    num_boost_round=int(params.get("n_estimators", 500)),
+    valid_sets=[val_data] if val_data else None,
     )
+
+
     preds_val = booster.predict(X_val) if X_val is not None else None
     return preds_val, booster
 
-# -------------------------
-# CNN-LSTM & Attention-LSTM
-# -------------------------
-def build_cnn_lstm_v51(input_shape, conv_filters=32, conv_kernel=3, lstm_units=64, dropout=0.2):
-    if tf is None:
-        raise RuntimeError("TensorFlow not available")
-    inp = Input(shape=input_shape)
-    x = Conv1D(filters=conv_filters, kernel_size=conv_kernel, activation="relu", padding="causal")(inp)
-    x = BatchNormalization()(x)
-    x = Conv1D(filters=conv_filters * 2, kernel_size=conv_kernel, activation="relu", padding="causal")(x)
-    x = BatchNormalization()(x)
-    x = LSTM(lstm_units, return_sequences=True)(x)
-    x = Attention()([x, x])  # self-attention
-    x = LSTM(lstm_units // 2)(x)
-    x = Dropout(dropout)(x)
-    out = Dense(1)(x)
-    model = Model(inp, out)
-    model.compile(optimizer="adam", loss="mse")
-    return model
-
-def build_attention_lstm_v51(input_shape, lstm_units=64, dropout=0.2):
-    if tf is None:
-        raise RuntimeError("TensorFlow not available")
-    inp = Input(shape=input_shape)
-    x = LSTM(lstm_units, return_sequences=True)(inp)
-    x = Attention()([x, x])
-    x = LSTM(lstm_units // 2)(x)
-    x = Dropout(dropout)(x)
-    out = Dense(1)(x)
-    model = Model(inp, out)
-    model.compile(optimizer="adam", loss="mse")
-    return model
 
 # -------------------------
 # Stacking (meta-learner)
@@ -1072,13 +1071,30 @@ def timedelta_from_freq(freq: str) -> pd.Timedelta:
         raise ValueError(f"Unsupported freq unit: {unit}")
     return pd.Timedelta(**{unit_map[unit]: val})
 
-def train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None):
+def train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None, target_name=None, progress_queue=None):
     model = build_small_lstm((lookback, n_features), units=128)
+
+    class QueueLogger(Callback):
+        def __init__(self, total_epochs, target_name, progress_queue):
+            super().__init__()
+            self.total_epochs = total_epochs
+            self.target_name = target_name
+            self.progress_queue = progress_queue
+
+        def on_epoch_end(self, epoch, logs=None):
+            if self.progress_queue:
+                loss = logs.get("loss", 0.0)
+                val_loss = logs.get("val_loss", 0.0)
+                self.progress_queue.put({
+                    "target": self.target_name,
+                    "status": f"LSTM epoch {epoch+1}/{self.total_epochs} "
+                              f"loss={loss:.4f} val_loss={val_loss:.4f}"
+                })
 
     callbacks = []
     if 'EarlyStopping' in globals():
         callbacks.append(EarlyStopping(monitor='loss', patience=5, restore_best_weights=True))
-    callbacks.append(RichKerasLogger(total_epochs=cfg.lstm_epochs, task_label="LSTM"))
+    callbacks.append(QueueLogger(cfg.lstm_epochs, target_name, progress_queue))
 
     model.fit(
         X_seq_train, y_seq_train_scaled,
@@ -1107,13 +1123,30 @@ def recursive_lstm_forecast(model, last_window, forecast_h, scaler_y):
 
     return np.array(preds, dtype=float)
 
-def train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None):
+def train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None, target_name=None, progress_queue=None):
     model = build_cnn_lstm((lookback, n_features), lstm_units=128, dropout_rate=0.2)
 
+    class QueueLogger(Callback):
+        def __init__(self, total_epochs, target_name, progress_queue):
+            super().__init__()
+            self.total_epochs = total_epochs
+            self.target_name = target_name
+            self.progress_queue = progress_queue
+
+        def on_epoch_end(self, epoch, logs=None):
+            if self.progress_queue:
+                loss = logs.get("loss", 0.0)
+                val_loss = logs.get("val_loss", 0.0)
+                self.progress_queue.put({
+                        "target": self.target_name,
+                        "status": f"CNN LSTM epoch {epoch+1}/{self.total_epochs} "
+                                f"loss={loss:.4f} val_loss={val_loss:.4f}"
+                    })
+
     callbacks = []
     if 'EarlyStopping' in globals():
         callbacks.append(EarlyStopping(monitor='loss', patience=5, restore_best_weights=True))
-    callbacks.append(RichKerasLogger(total_epochs=cfg.lstm_epochs, task_label="CNN-LSTM"))
+    callbacks.append(QueueLogger(cfg.lstm_epochs, target_name, progress_queue))
 
     model.fit(
         X_seq_train, y_seq_train_scaled,
@@ -1126,26 +1159,30 @@ def train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, 
 
     return model
 
-def recursive_cnn_lstm_forecast(model, last_window, forecast_h, scaler_y):
-    preds = []
-    current_window = last_window.copy()
-
-    for _ in range(forecast_h):
-        next_scaled = model.predict(current_window, verbose=0).reshape(-1)[0]
-        next_val = scaler_y.inverse_transform([[next_scaled]])[0, 0]
-        preds.append(float(next_val))
-        current_window = np.roll(current_window, -1, axis=1)
-        current_window[0, -1, 0] = next_scaled  # target assumed first feature
-
-    return np.array(preds, dtype=float)
-
-def train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None):
+def train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None, target_name=None, progress_queue=None):
     model = build_attention_lstm((lookback, n_features), lstm_units=128, dropout_rate=0.2)
 
+    class QueueLogger(Callback):
+        def __init__(self, total_epochs, target_name, progress_queue):
+            super().__init__()
+            self.total_epochs = total_epochs
+            self.target_name = target_name
+            self.progress_queue = progress_queue
+
+        def on_epoch_end(self, epoch, logs=None):
+            if self.progress_queue:
+                loss = logs.get("loss", 0.0)
+                val_loss = logs.get("val_loss", 0.0)
+                self.progress_queue.put({
+                        "target": self.target_name,
+                        "status": f"LSTM epoch {epoch+1}/{self.total_epochs} "
+                                f"loss={loss:.4f} val_loss={val_loss:.4f}"
+                    })
+
     callbacks = []
     if 'EarlyStopping' in globals():
         callbacks.append(EarlyStopping(monitor='loss', patience=5, restore_best_weights=True))
-    callbacks.append(RichKerasLogger(total_epochs=cfg.lstm_epochs, task_label="Attention-LSTM"))
+    callbacks.append(QueueLogger(cfg.lstm_epochs, target_name, progress_queue))
 
     model.fit(
         X_seq_train, y_seq_train_scaled,
@@ -1158,18 +1195,6 @@ def train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_feat
 
     return model
 
-def recursive_attention_lstm_forecast(model, last_window, forecast_h, scaler_y):
-    preds = []
-    current_window = last_window.copy()
-
-    for _ in range(forecast_h):
-        next_scaled = model.predict(current_window, verbose=0).reshape(-1)[0]
-        next_val = scaler_y.inverse_transform([[next_scaled]])[0, 0]
-        preds.append(float(next_val))
-        current_window = np.roll(current_window, -1, axis=1)
-        current_window[0, -1, 0] = next_scaled  # target assumed first feature
-
-    return np.array(preds, dtype=float)
 
 
 # -------------------------
@@ -1178,9 +1203,8 @@ def recursive_attention_lstm_forecast(model, last_window, forecast_h, scaler_y):
 def forecast_univariate(series: pd.Series,
                         features_df: pd.DataFrame,
                         cfg: CLIConfig,
-                        target_name: str = "Close"):  # <-- new param
-    saved_models = {}  # will store all trained models
-    last_seq_dict = {} # for LSTM-family
+                        target_name: str = "Close",
+                        progress_queue: Queue = None):  # <-- new param
     val_h = cfg.val_horizon  # use dynamic horizon
     forecast_h = cfg.forecast_horizon
 
@@ -1199,18 +1223,32 @@ def forecast_univariate(series: pd.Series,
     train_series = series.iloc[:n_train]
 
     # EMA baseline
-    ema_val_preds, ema_next = ema_baseline(series, span=max(12, cfg.candles//3), val_horizon=val_h)
-    ema_forecast = np.repeat(ema_next, forecast_h)
+    try:
+        if progress_queue: 
+            progress_queue.put({"target": target_name, "status": "Running EMA..."})
+        ema_val_preds, ema_next = ema_baseline(series, span=max(12, cfg.candles//3), val_horizon=val_h)
+        ema_forecast = np.repeat(ema_next, forecast_h)
+    except Exception as e:
+        logger.warning(f"{target_name} EMA failed: {e}")
 
     # SARIMAX
-    sarima_preds, sarima_info = sarimax_small_grid_forecast(train_series, val_h, seasonal=False)
-    sarima_next = float(sarima_preds[-1]) if len(sarima_preds) > 0 else float(train_series.iloc[-1])
-    sarima_forecast_preds, _ = sarimax_small_grid_forecast(series, forecast_h, seasonal=False)
+    try:
+        if progress_queue: progress_queue.put({"target": target_name, "status": "Running SARIMAX..."})
+        sarima_preds, sarima_model = sarimax_small_grid_forecast(
+            train_series, val_h, seasonal=False
+        )
+        sarima_next = float(sarima_preds[-1]) if len(sarima_preds) > 0 else float(train_series.iloc[-1])
+        sarima_forecast_preds, _ = sarimax_small_grid_forecast(
+            series, forecast_h, seasonal=False
+        )
+    except Exception as e:
+        logger.warning(f"{target_name} SARIMAX failed: {e}")
     
     # Prophet
     prophet_preds = None
     if cfg.use_prophet and Prophet is not None:
         try:
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running Prophet..."})
             prophet_preds, prophet_model = prophet_forecast(train_series, val_h)
         except Exception as e:
             logger.warning(f"Prophet failed: {e}")
@@ -1222,12 +1260,6 @@ def forecast_univariate(series: pd.Series,
         except Exception as e:
             logger.warning(f"Prophet forward failed: {e}")
             prophet_forecast_preds = None
-            
-    saved_models["EMA_last"] = float(ema_next)
-    if sarima_forecast_preds is not None:
-        saved_models["SARIMAX"] = sarima_info['model']  # assuming sarimax_small_grid_forecast returns model
-    if prophet_forecast_preds is not None:
-        saved_models["Prophet"] = prophet_model_full  # assuming you keep prophet model object
 
     # Prepare tabular features for XGBoost/LSTM: fit scalers on train only
     features = features_df.copy()
@@ -1247,32 +1279,34 @@ def forecast_univariate(series: pd.Series,
     tree_model_fns = []
     if cfg.use_random_forest:
         def rf_fn(X_tab_train, y_tab_train, X_tab_val):
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running RandomForest..."})
             params_rf = {
                 "n_estimators": getattr(cfg, "rf_n_estimators", 300),
                 "max_depth": getattr(cfg, "rf_max_depth", None),
                 "min_samples_leaf": getattr(cfg, "rf_min_samples_leaf", 1),
             }
-            mdl = train_random_forest_v51(X_tab_train, y_tab_train, X_tab_val, params=params_rf)
-            saved_models["Random_Forest"] = mdl  # save in memory
-            # optional: save to disk
-            # joblib.dump(mdl, "saved_models/random_forest.pkl")
-            return mdl
+            preds_val, model = train_random_forest_v51(
+                X_tab_train, y_tab_train, X_tab_val, params=params_rf
+            )
+            return preds_val, model   # ✅ return both
         tree_model_fns.append(rf_fn)
 
     if cfg.use_lightgbm and lgb:
         def lgb_fn(X_tab_train, y_tab_train, X_tab_val):
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running LightGBM..."})
             params_lgb = {
                 "n_estimators": getattr(cfg, "lgb_n_estimators", 500),
                 "learning_rate": getattr(cfg, "lgb_learning_rate", 0.05),
                 "max_depth": getattr(cfg, "lgb_max_depth", -1),
                 "num_leaves": getattr(cfg, "lgb_num_leaves", 31),
+                "verbose": -1
             }
-            mdl = train_lightgbm_v51(X_tab_train, y_tab_train, X_tab_val, params=params_lgb)
-            saved_models["Lightgbm"] = mdl  # save in memory
-            # optional: save to disk
-            # joblib.dump(mdl, "saved_models/lightgbm.pkl")
-            return mdl
+            preds_val, booster = train_lightgbm_v51(
+                X_tab_train, y_tab_train, X_tab_val, params=params_lgb
+            )
+            return preds_val, booster   # ✅ return both
         tree_model_fns.append(lgb_fn)
+
 
     # Generate OOF predictions and train meta-learner
     preds_by_tree_model, forecast_by_tree_model, tree_metrics, tree_weights = {}, {}, {}, {}
@@ -1282,17 +1316,17 @@ def forecast_univariate(series: pd.Series,
         for i, fn in enumerate(tree_model_fns):
             try:
                 _, mdl = fn(X_scaled_full, y_all, None)
-                saved_models[f"Tree_Model_{i}"] = mdl
                 last_feat = np.repeat(X_scaled_full[-1:], forecast_h, axis=0)
                 forecast_by_tree_model[f"MODEL_{i}"] = mdl.predict(last_feat)
                 preds_by_tree_model[f"MODEL_{i}"] = mdl.predict(X_scaled_full[-val_h:])
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed: {e}")
                 preds_by_tree_model[f"MODEL_{i}"] = np.repeat(y_all[-1], val_h)
                 forecast_by_tree_model[f"MODEL_{i}"] = np.repeat(y_all[-1], forecast_h)
 
+        if progress_queue: progress_queue.put({"target": target_name, "status": "Running MetaLearner..."})
         stack_for_forecast = np.vstack([forecast_by_tree_model[k] for k in sorted(forecast_by_tree_model.keys())]).T
         ensemble_forecast_tree = meta_learner.predict(stack_for_forecast)
-        saved_models["Meta_Learner"] = meta_learner
         preds_by_tree_model["ENSEMBLE_META"] = np.repeat(ensemble_forecast_tree[0], val_h)
         forecast_by_tree_model["ENSEMBLE_META"] = ensemble_forecast_tree
 
@@ -1303,6 +1337,7 @@ def forecast_univariate(series: pd.Series,
     if cfg.use_xgboost and xgb is not None:
         try:
             # Validation phase
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running XGBoost..."})
             X_tab_train = X_scaled_full[:n_train]
             y_tab_train = y_all[:n_train]
             X_tab_val   = X_scaled_full[n_train:n_train+val_h]
@@ -1319,7 +1354,7 @@ def forecast_univariate(series: pd.Series,
 
             _, xgb_forecast, xgb_model_obj = xgboost_forecast(
                 X_tab_full, y_tab_full, X_future=features_future)
-
+            
             if xgb_forecast is None:
                 # fallback if no future features
                 xgb_forecast = np.repeat(float(y_tab_full[-1]), forecast_h)
@@ -1382,41 +1417,87 @@ def forecast_univariate(series: pd.Series,
                 y_seq_val_scaled = scaler_y.transform(y_seq_val.reshape(-1, 1)).reshape(-1)
 
                 if cfg.use_lstm:
-                    model = train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                             X_seq_val, y_seq_val_scaled)
-                    preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                    lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                    model_full = train_lstm_model(X_seq, scaler_y.transform(y_seq.reshape(-1,1)).reshape(-1),
-                                                  lookback, X_seq.shape[2], cfg, scaler_y)
-                    lstm_forecast = recursive_lstm_forecast(model_full, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    try:
+                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running Vanilla LSTM..."})
+                        
+                        model = train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
+                                                X_seq_val, y_seq_val_scaled, target_name, progress_queue)
+                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
+                        lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
+                        model.fit(
+                            X_seq,
+                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
+                            epochs=max(1, cfg.lstm_epochs // 2),
+                            batch_size=cfg.lstm_batch,
+                            verbose=0
+                        )
+                        lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    except Exception as e:
+                        logger.warning(f"Vanilla LSTM failed: {e}")
+                        lstm_preds, lstm_forecast = None, None
+
+                    finally:
+                        K.clear_session()
+                        gc.collect()
 
                 if cfg.use_cnn_lstm:
-                    model = train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                                 X_seq_val, y_seq_val_scaled)
-                    preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                    cnn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                    model_full = train_cnn_lstm_model(X_seq, scaler_y.transform(y_seq.reshape(-1,1)).reshape(-1),
-                                                      lookback, X_seq.shape[2], cfg, scaler_y)
-                    cnn_lstm_forecast = recursive_cnn_lstm_forecast(model_full, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    try:
+                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running CNN LSTM..."})
+                        
+                        model = train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
+                                                    X_seq_val, y_seq_val_scaled, target_name, progress_queue)
+                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
+                        cnn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
+                        model.fit(
+                            X_seq,
+                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
+                            epochs=max(1, cfg.lstm_epochs // 2),
+                            batch_size=cfg.lstm_batch,
+                            verbose=0
+                        )
+                        cnn_lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    except Exception as e:
+                        logger.warning(f"CNN LSTM failed: {e}")
+                        cnn_lstm_preds, cnn_lstm_forecast = None, None
+
+                    finally:
+                        K.clear_session()
+                        gc.collect()
 
                 if cfg.use_attention_lstm:
-                    model = train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                                      X_seq_val, y_seq_val_scaled)
-                    preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                    attn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                    model_full = train_attention_lstm_model(X_seq, scaler_y.transform(y_seq.reshape(-1,1)).reshape(-1),
-                                                            lookback, X_seq.shape[2], cfg, scaler_y)
-                    attn_lstm_forecast = recursive_attention_lstm_forecast(model_full, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    try:
+                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running Attention LSTM..."})
+                        
+                        model = train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
+                                                        X_seq_val, y_seq_val_scaled, target_name, progress_queue)
+                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
+                        attn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
+                        model.fit(
+                            X_seq,
+                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
+                            epochs=max(1, cfg.lstm_epochs // 2),
+                            batch_size=cfg.lstm_batch,
+                            verbose=0
+                        )
+                        attn_lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
+                    except Exception as e:
+                        logger.warning(f"Attention LSTM failed: {e}")
+                        attn_lstm_preds, attn_lstm_forecast = None, None
+
+                    finally:
+                        K.clear_session()
+                        gc.collect()
+                    
 
             except Exception as e:
                 logger.warning(f"LSTM failed: {e}")
                 lstm_preds = None
-                lstm_next = float(series.iloc[-1])
-
 
     # Collect predictions
     preds_by_model = {}
     next_preds = {}
+
+    if progress_queue: progress_queue.put({"target": target_name, "status": "Validating Model Predictions..."})
 
     preds_by_model["EMA"] = ema_val_preds[-val_h:]
     preds_by_model["SARIMAX"] = sarima_preds
@@ -1424,7 +1505,6 @@ def forecast_univariate(series: pd.Series,
         preds_by_model["Prophet"] = prophet_preds
     if xgb_preds is not None:
         preds_by_model["XGBoost"] = np.array(xgb_preds, dtype=float)
-    # preds_by_model.update(np.array(preds_by_tree_model, dtype=float) or {})
     preds_by_model.update(preds_by_tree_model or {})
     if lstm_preds is not None:
         preds_by_model["LSTM"] = np.array(lstm_preds, dtype=float)
@@ -1444,7 +1524,9 @@ def forecast_univariate(series: pd.Series,
         elif arr.shape[0] > val_h:
             arr = arr[-val_h:]
         preds_by_model[k] = arr
-        
+    
+    if progress_queue: progress_queue.put({"target": target_name, "status": "Forecasting Model Predictions..."})
+    
     forecast_by_model = {}
     forecast_by_model["EMA"] = ema_forecast
     if sarima_forecast_preds is not None:
@@ -1453,7 +1535,6 @@ def forecast_univariate(series: pd.Series,
         forecast_by_model["Prophet"] = np.asarray(prophet_forecast_preds, dtype=float)
     if xgb_forecast is not None:
         forecast_by_model["XGBoost"] = np.asarray(xgb_forecast, dtype=float)
-    # forecast_by_model.update(np.array(forecast_by_tree_model, dtype=float) or {})
     forecast_by_model.update(forecast_by_tree_model or {})
     if lstm_forecast is not None:
         forecast_by_model["LSTM"] = np.asarray(lstm_forecast, dtype=float)
@@ -1474,66 +1555,7 @@ def forecast_univariate(series: pd.Series,
             arr = arr[:forecast_h]
         forecast_by_model[k] = arr
         
-    # y_val_actual = y_all[n_train:n_train+val_h].astype(float)
-
-    # # -------------------- Compute ATR for VolAdjError --------------------
-    # price_changes = np.abs(np.diff(y_val_actual))
-    # avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
-
-    # # -------------------- Ensemble validation preds (use last weights if available) --------------------
-    # if "last_weights" in locals() and last_weights:   # carry-over from previous run
-    #     val_weights = last_weights
-    # else:
-    #     # fallback: equal weights if first run
-    #     equal_weight = 1.0 / len(preds_by_model)
-    #     val_weights = {k: equal_weight for k in preds_by_model}
-
-    # ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
-    # for k, w in val_weights.items():
-    #     if k in preds_by_model:
-    #         ensemble_val_preds += preds_by_model[k] * w
-    # preds_by_model["ENSEMBLE"] = ensemble_val_preds
-
-    # # -------------------- Metrics --------------------
-    # metrics = {}
-    # for k, arr in preds_by_model.items():
-    #     mae = float(mean_absolute_error(y_val_actual, arr))
-    #     rmse = float(math.sqrt(mean_squared_error(y_val_actual, arr)))
-    #     mape = float(safe_mape(y_val_actual, arr))
-    #     vol_adj = mae / (avg_true_range + 1e-6)  # penalize models that ignore volatility
-    #     metrics[k] = {"MAE": mae, "RMSE": rmse, "MAPE%": mape, "VolAdjError": vol_adj}
-
-    # # -------------------- VolAdj-based weights (new weights for next round) --------------------
-    # eps = 1e-8
-    # inv = {k: 1.0 / (metrics[k]["VolAdjError"] + eps) for k in metrics}
-    # total = sum(inv.values())
-    # weights = {k: v / total for k, v in inv.items()}
-
-    # # bias LSTMs a little if they all agree
-    # lstm_models = ["LSTM", "CNN-LSTM", "Attention-LSTM"]
-    # lstm_forecasts = [forecast_by_model[m] for m in lstm_models if m in forecast_by_model]
-
-    # if len(lstm_forecasts) >= 2:
-    #     slopes = [np.sign(f[-1] - f[0]) for f in lstm_forecasts]
-    #     if all(s == 1 for s in slopes):   # bullish bias
-    #         for m in lstm_models:
-    #             if m in weights:
-    #                 weights[m] *= 1.2
-    #     elif all(s == -1 for s in slopes):  # bearish bias
-    #         for m in lstm_models:
-    #             if m in weights:
-    #                 weights[m] *= 1.2
-
-    # # -------------------- Final Ensemble forecast --------------------
-    # ensemble_forecast = np.zeros(forecast_h, dtype=float)
-    # for k, w in weights.items():
-    #     if k in forecast_by_model:
-    #         ensemble_forecast += forecast_by_model[k] * w
-    # forecast_by_model["ENSEMBLE"] = ensemble_forecast
-
-    # # -------------------- Save weights for next iteration --------------------
-    # last_weights = weights.copy()
-    
+    if progress_queue: progress_queue.put({"target": target_name, "status": "Calculating Weights & Metrics..."})
     
     y_val_actual = y_all[n_train:n_train+val_h].astype(float) 
     weights = inverse_error_weights(y_val_actual, preds_by_model)
@@ -1547,10 +1569,10 @@ def forecast_univariate(series: pd.Series,
         slopes = [np.sign(f[-1] - f[0]) for f in lstm_forecasts]
         if all(s == 1 for s in slopes):
             for m in lstm_models:
-                if m in weights: weights[m] *= 1.35
+                if m in weights: weights[m] *= 1.5
         elif all(s == -1 for s in slopes):
             for m in lstm_models:
-                if m in weights: weights[m] *= 1.35
+                if m in weights: weights[m] *= 1.5
     
     ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
     for k,w in weights.items():
@@ -1574,6 +1596,8 @@ def forecast_univariate(series: pd.Series,
 
   
     # -------------------- Future timestamps --------------------
+    if progress_queue: progress_queue.put({"target": target_name, "status": "Formatting Next Predictions..."})
+    
     last_time = series.index[-1]
     freq = pd.infer_freq(series.index) or '1D'
     future_timestamps = pd.date_range(
@@ -1586,6 +1610,8 @@ def forecast_univariate(series: pd.Series,
     strategies = {}
     try:
         # df for the target: we operate on features_df aligned earlier
+        if progress_queue: progress_queue.put({"target": target_name, "status": "Detecting Strategies..."})
+        
         target_df = features_df.copy()
         # Breakout
         strategies["breakout"] = detect_breakout(target_df, target_col=target_name)
@@ -1628,166 +1654,17 @@ def forecast_univariate(series: pd.Series,
 
     # attempt to free memory
     try:
+        if progress_queue: progress_queue.put({"target": target_name, "status": "Cleaning Memory..."})
+        if progress_queue: progress_queue.put({"target": target_name, "status": "Finished all models"})
         del X_all, X_scaled_full
+        K.clear_session()
         gc.collect()
+        progress_queue.put(None)
     except Exception:
         pass
 
-    return preds_by_model, next_preds, metrics, weights, strategies
-
-def forecast_incremental(new_series: pd.Series,
-                         new_features_df: pd.DataFrame,
-                         cfg: CLIConfig,
-                         saved_models: dict,
-                         last_seq_dict: dict,
-                         target_name: str = "Close"):
-    """
-    Incremental forecasting using previously trained models.
-    Returns:
-        preds_by_model: in-sample predictions for new data
-        next_preds: forecast for future timestamps
-        metrics: error metrics on validation
-        weights: ensemble weights
-        strategies: detected strategies
-        incremental_preds: same as next_preds but using only incremental logic
-    """
-    val_h = cfg.val_horizon
-    forecast_h = cfg.forecast_horizon
-
-    # Align and sanitize indices
-    new_series = _ensure_series_has_datetime_index(new_series)
-    new_features_df.index = _ensure_datetime_index_tz_naive(new_features_df.index)
-    new_features_df, new_series = new_features_df.align(new_series, join="inner", axis=0)
-    new_features_df = new_features_df.dropna()
-    new_series = new_series.loc[new_features_df.index].dropna()
-    if len(new_series) < val_h + 1:
-        raise ValueError("Not enough incremental data after alignment")
-
-    X_all = new_features_df.values.astype(float)
-    y_all = new_series.values.astype(float)
-
-    # -------------------- EMA / SARIMAX / Prophet --------------------
-    ema_last = saved_models.get("EMA_last", float(y_all[-1]))
-    ema_val_preds = np.repeat(ema_last, len(new_series))
-    ema_forecast = np.repeat(ema_last, forecast_h)
-
-    sarima_preds = None
-    if saved_models.get("SARIMAX") is not None:
-        sarima_model = saved_models["SARIMAX"]
-        sarima_preds = sarima_model.predict(start=0, end=len(new_series)-1)
-        sarima_forecast_preds = sarima_model.get_forecast(steps=forecast_h).predicted_mean.values
-    else:
-        sarima_forecast_preds = np.repeat(float(y_all[-1]), forecast_h)
-
-    prophet_preds = None
-    prophet_forecast_preds = None
-    if saved_models.get("Prophet") is not None:
-        try:
-            prophet_model = saved_models["Prophet"]
-            prophet_preds = prophet_model.predict(pd.DataFrame({"ds": new_series.index}))["yhat"].values
-            future_df = pd.DataFrame({"ds": pd.date_range(start=new_series.index[-1] + timedelta_from_freq(pd.infer_freq(new_series.index) or '1D'),
-                                                          periods=forecast_h, freq=pd.infer_freq(new_series.index) or '1D')})
-            prophet_forecast_preds = prophet_model.predict(future_df)["yhat"].values
-        except Exception:
-            prophet_forecast_preds = np.repeat(float(y_all[-1]), forecast_h)
-
-    # -------------------- Tree / XGBoost / LGBM --------------------
-    scaler_X = RobustScaler()
-    scaler_X.fit(X_all)
-    X_scaled_full = scaler_X.transform(X_all)
-    features_future = np.repeat(X_scaled_full[-1:], forecast_h, axis=0)
-
-    tree_models = ["RF", "LGBM", "XGBoost"]
-    preds_by_model = {}
-    forecast_by_model = {}
-    incremental_preds = {}
-
-    for model_name in tree_models:
-        model = saved_models.get(model_name)
-        if model is not None:
-            preds_by_model[model_name] = model.predict(X_scaled_full)
-            forecast_by_model[model_name] = model.predict(features_future)
-            incremental_preds[model_name] = forecast_by_model[model_name]
-
-    # -------------------- LSTM-family --------------------
-    lstm_models = ["LSTM", "CNN-LSTM", "Attention-LSTM"]
-    for model_name in lstm_models:
-        model = saved_models.get(model_name)
-        last_seq = last_seq_dict.get(model_name)
-        if model is not None and last_seq is not None:
-            incremental_preds[model_name] = recursive_lstm_forecast(model, last_seq, forecast_h, cfg.scaler_y)
-
-    # -------------------- EMA / SARIMAX / Prophet incremental --------------------
-    incremental_preds["EMA"] = ema_forecast
-    incremental_preds["SARIMAX"] = sarima_forecast_preds
-    if prophet_forecast_preds is not None:
-        incremental_preds["Prophet"] = prophet_forecast_preds
-
-    # -------------------- In-sample preds --------------------
-    preds_by_model["EMA"] = ema_val_preds
-    preds_by_model["SARIMAX"] = sarima_preds if sarima_preds is not None else ema_val_preds
-    if prophet_preds is not None:
-        preds_by_model["Prophet"] = prophet_preds
-
-    # -------------------- Ensemble weights --------------------
-    y_val_actual = y_all[-val_h:].astype(float)
-    weights = inverse_error_weights(y_val_actual, preds_by_model)
-
-    # LSTM slope bias
-    lstm_forecasts = [incremental_preds[m] for m in lstm_models if m in incremental_preds]
-    if len(lstm_forecasts) >= 2:
-        slopes = [np.sign(f[-1]-f[0]) for f in lstm_forecasts]
-        if all(s==1 for s in slopes):
-            for m in lstm_models: weights[m] = weights.get(m, 0) * 1.35
-        elif all(s==-1 for s in slopes):
-            for m in lstm_models: weights[m] = weights.get(m, 0) * 1.35
-
-    # Ensemble incremental
-    ensemble_forecast = np.zeros(forecast_h, dtype=float)
-    for k, w in weights.items():
-        if k in incremental_preds:
-            ensemble_forecast += incremental_preds[k] * w
-    incremental_preds["ENSEMBLE"] = ensemble_forecast
-
-    # -------------------- Metrics --------------------
-    price_changes = np.abs(np.diff(y_val_actual))
-    avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
-    metrics = {}
-    for k, arr in preds_by_model.items():
-        mae = float(mean_absolute_error(y_val_actual, arr))
-        rmse = float(math.sqrt(mean_squared_error(y_val_actual, arr)))
-        mape = float(safe_mape(y_val_actual, arr))
-        vol_adj = mae / (avg_true_range + 1e-6)
-        metrics[k] = {"MAE": mae, "RMSE": rmse, "MAPE%": mape, "VolAdjError": vol_adj}
-
-    # -------------------- Future timestamps --------------------
-    last_time = new_series.index[-1]
-    freq = pd.infer_freq(new_series.index) or '1D'
-    future_timestamps = pd.date_range(
-        start=last_time + timedelta_from_freq(freq),
-        periods=forecast_h, freq=freq).tolist()
-    next_preds = {model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)}
-                  for model, arr in incremental_preds.items()}
-
-    # -------------------- Strategy detection --------------------
-    strategies = {}
-    try:
-        target_df = new_features_df.copy()
-        strategies["breakout"] = detect_breakout(target_df, target_col=target_name)
-        strategies["mean_reversion"] = detect_mean_reversion(target_df, target_col=target_name)
-        strategies["fibonacci"] = detect_fibonacci_pullback(target_df, target_col=target_name)
-        strategies["price_action"] = detect_price_action(target_df)
-        strategies["swing"] = detect_swing_trade(target_df, target_col=target_name)
-        strategies["scalping_helper"] = detect_scalping_opportunity(target_df, target_col=target_name)
-        strategies["regime"] = detect_market_regime(target_df)
-        strategies["options_summary"] = fetch_options_flow_stub(cfg.ticker) if hasattr(cfg, "ticker") else {}
-        strategies["news_sentiment"] = fetch_news_sentiment_stub(cfg.ticker) if hasattr(cfg, "ticker") else None
-    except Exception:
-        strategies = {}
-
-    return preds_by_model, next_preds, metrics, weights, strategies, incremental_preds
-
-
+    # return saved_models, last_seq_dict, scaler_y
+    return  next_preds, metrics, weights, strategies
 
 def adjust_predictions(target, next_preds, model_sums, current_values):
     """
@@ -1826,54 +1703,96 @@ def adjust_predictions(target, next_preds, model_sums, current_values):
 # -------------------------
 # Orchestration for OHLC
 # -------------------------
-def predict_all_ohlcv(df: pd.DataFrame, cfg: CLIConfig):
+
+def predict_all_ohlcv(df: pd.DataFrame, cfg) -> dict:
+    """
+    Predict OHLC using forecast_univariate for each column with separate progress bars.
+    Returns a dict with adjusted predictions, metrics, weights, and strategies.
+    """
     results = {}
-    try:
-        df.index = _ensure_datetime_index_tz_naive(df.index)
-    except Exception:
-        pass
+    targets = ["Open", "High", "Low", "Close"]
+    manager = Manager()
+    progress_queue = manager.Queue()
+
+    # Count total steps per target (roughly # of models per target)
+    total_steps = 20 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta (adjust as needed)
     
-    last_candle = df.iloc[-1]
-    current_close = last_candle.get('Close', 0)
-    current_high = last_candle.get('High', 0)
-    current_low = last_candle.get('Low', 0)
-    current_open = last_candle.get('Open', 0)
-    current_values = {
-        "Open": current_open,
-        "High": current_high,
-        "Low": current_low,
-        "Close": current_close
+    console.print()
+    console.rule(f"[bold cyan]Forecast Progress", align='left')
+    
+
+    # Create a separate tqdm bar for each target
+    progress_bars = {
+        target: tqdm(
+        total=total_steps,
+        desc=target,
+        position=i,
+        leave=True,
+        ncols=int(os.get_terminal_size().columns * 0.6),  # 50% screen width
+        bar_format="{desc:<8} {percentage:3.0f}%|{bar}| {postfix} [{elapsed}]",
+    )
+        for i, target in enumerate(targets)
     }
     
-    features = compute_indicators(df)
 
-    # for target in ["Open", "High", "Low", "Close"]:
-    for target in ["Close"]:
-        try:
-            preds_by_model, next_preds, metrics, weights, strategies = forecast_univariate(
-                df[target], features, cfg, target_name=target)
-            # print('Next Preds -> ', next_preds)
-            
-            model_sums = {name: vals["MAE"] + vals["RMSE"] + vals["MAPE%"] for name, vals in metrics.items()}
-            
-            
-            adjusted_preds = adjust_predictions(target, next_preds, model_sums, current_values)
-            # print(adjusted_preds)    
+    # Queue reader thread
+    def queue_reader(queue: Queue):
+        completed_bars = {t: 0 for t in targets}
+        while True:
+            msg = queue.get()
+            if msg is None:  # Sentinel to stop
+                break
+            target, status = msg.get("target"), msg.get("status")
+            if target in progress_bars:
+                bar = progress_bars[target]
+                bar.update(1)
+                completed_bars[target] += 1
+                bar.set_postfix_str(status)  # Show status beside the bar
+                bar.refresh()
 
-            # No need to call get_future_timestamps() separately; forecast_univariate already returns mapped timestamps
-            results[target] = {
-                "next_preds": next_preds,
-                "adjusted_preds": adjusted_preds,
-                "metrics": metrics,
-                "weights": weights,
-            }
+    reader_thread = threading.Thread(target=queue_reader, args=(progress_queue,), daemon=True)
+    reader_thread.start()
 
-        except Exception as e:
-            logger.exception(f"Failed forecasting {target}: {e}")
-            results[target] = {"error": str(e)}
+    # Run forecasting in parallel
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(
+                forecast_univariate,
+                df[target],
+                df,  # or precomputed features
+                cfg,
+                target_name=target,
+                progress_queue=progress_queue
+            ): target
+            for target in targets
+        }
 
+        for future in as_completed(futures):
+            target = futures[future]
+            try:
+                next_preds, metrics, weights, strategies = future.result()
+                results[target] = {
+                    "adjusted_preds": next_preds,
+                    "metrics": metrics,
+                    "weights": weights,
+                    "strategies": strategies
+                }
+            except Exception as e:
+                results[target] = {"error": str(e)}
+
+    # Stop the reader thread
+    progress_queue.put(None)
+    reader_thread.join()
+
+    # Close all bars
+    for bar in progress_bars.values():
+        bar.n = total_steps
+        bar.set_postfix_str("Done")
+        bar.close()
+        bar.clear()
+    
+    console.rule(style="cyan")
     return results
-
 
 # -------------------------
 # Trading signal analysis
@@ -1922,12 +1841,9 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
         }
 
     # ====== Extract Predicted Values ======
-    # next_open = list(results.get('Open', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
-    # next_high = list(results.get('High', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
-    # The code is trying to access a specific value from a nested dictionary structure. It is
-    # attempting to retrieve the value of the key 'ENSEMBLE' from the dictionary
-    # results['Open']['adjusted_preds'], and then getting the first value from that dictionary.
-    # next_low = list(results.get('Low', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
+    next_open = list(results.get('Open', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
+    next_high = list(results.get('High', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
+    next_low = list(results.get('Low', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
     next_close = list(results.get('Close', {}).get('adjusted_preds', {}).get('ENSEMBLE', {}).values())[0]
 
 
@@ -2041,39 +1957,61 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
     if lower_wick_index != -1 and upper_wick_index != -1:
         if lower_wick_index > upper_wick_index:  # lower wick after upper wick → strong bullish
             bull_score += 1
-            reasons.append("Lower wick appeared after upper wick → extra bullish pressure.")
-            strategiesInfluenced.append("Sequential Candle Wick Analysis")
+            reasons.append("Previous lower wick appeared after upper wick → extra bullish pressure.")
+            strategiesInfluenced.append("Previous sequential Candle Wick Analysis")
         elif lower_wick_index < upper_wick_index:  # lower wick before upper wick → strong bearish
             bear_score += 1
-            reasons.append("Lower wick appeared before upper wick → extra bearish pressure.")
-            strategiesInfluenced.append("Sequential Candle Wick Analysis")
+            reasons.append("Previous lower wick appeared before upper wick → extra bearish pressure.")
+            strategiesInfluenced.append("Previous sequential Candle Wick Analysis")
 
     # ====== 2. Predicted Candle ======
-    # next_signals = analyze_candle(next_open, next_high, next_low, next_close)
-    # for s in next_signals:
-    #     s_lower = s.lower()
-    #     if "long_lower_wick" in s_lower or "buy" in s_lower:
-    #         bull_score += WEIGHTS["candle"]
-    #         reasons.append("Predicted candle shows a long lower wick → model expects buying pressure    near lows.")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
-    #     elif "long_upper_wick" in s_lower or "sell" in s_lower:
-    #         bear_score += WEIGHTS["candle"]
-    #         reasons.append("Predicted candle shows a long upper wick → model expects selling pressure   near highs.")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
-    #     elif "strong_bullish_body" in s_lower:
-    #         bull_score += WEIGHTS["candle"]
-    #         reasons.append("Predicted candle indicates a strong bullish body — expected upward  momentum.")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
-    #     elif "strong_bearish_body" in s_lower:
-    #         bear_score += WEIGHTS["candle"]
-    #         reasons.append("Predicted candle indicates a strong bearish body — expected downward    momentum.")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
-    #     elif "indecision" in s_lower or "doji" in s_lower:
-    #         reasons.append("Predicted candle looks indecisive — model forecasts uncertainty.")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
-    #     else:
-    #         reasons.append(f"Predicted candle pattern: {s}")
-    #         strategiesInfluenced.append("Forecasted Candle Analytics")
+    next_signals = analyze_candle(next_open, next_high, next_low, next_close)
+    next_lower_wick_index = -1
+    next_upper_wick_index = -1
+    
+    for i, s in enumerate(next_signals):
+        s_lower = s.lower()
+
+        # Remember the index of the wick signals
+        if "long_lower_wick" in s_lower:
+            lower_wick_index = i
+        elif "long_upper_wick" in s_lower:
+            upper_wick_index = i
+
+        # Original scoring logic
+        if "long_lower_wick" in s_lower or "buy" in s_lower:
+            bull_score += WEIGHTS["candle"]
+            reasons.append("Predicted candle shows a long lower wick → buyers defended lower prices; short-term bullish pressure.")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+        elif "long_upper_wick" in s_lower or "sell" in s_lower:
+            bear_score += WEIGHTS["candle"]
+            reasons.append("Predicted candle shows a long upper wick → sellers rejected higher prices; short-term bearish pressure.")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+        elif "strong_bullish_body" in s_lower:
+            bull_score += WEIGHTS["candle"]
+            reasons.append("Predicted candle closed strongly higher (large body) — bullish momentum confirmed.")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+        elif "strong_bearish_body" in s_lower:
+            bear_score += WEIGHTS["candle"]
+            reasons.append("Predicted candle closed strongly lower (large body) — bearish momentum confirmed.")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+        elif "indecision" in s_lower or "doji" in s_lower:
+            reasons.append("Predicted candle is indecisive (small body, large wicks) — market uncertainty; wait for confirmation.")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+        else:
+            reasons.append(f"Predicted candle pattern: {s}")
+            strategiesInfluenced.append("Predicted Candle Analytics")
+
+    # ------------------- New logic for sequential wick influence -------------------
+    if next_lower_wick_index != -1 and next_upper_wick_index != -1:
+        if next_lower_wick_index > next_upper_wick_index:  # lower wick after upper wick → strong bullish
+            bull_score += 1
+            reasons.append("Predicted candle's lower wick appeared after upper wick → extra bullish pressure.")
+            strategiesInfluenced.append("Predicted Sequential Candle Wick Analysis")
+        elif next_lower_wick_index < next_upper_wick_index:  # lower wick before upper wick → strong bearish
+            bear_score += 1
+            reasons.append("Predicted candle's lower wick appeared before upper wick → extra bearish pressure.")
+            strategiesInfluenced.append("Predicted Sequential Candle Wick Analysis")
 
     # ====== 3. Prediction Trend ======
     if next_close > current_close:
@@ -2086,7 +2024,7 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
         strategiesInfluenced.append("Trend Analytics")
 
     # ====== 4. Strategies ======
-    strategies = {k: results.get(k, {}).get('strategies', {}) for k in ['Open', 'High', 'Low', 'Close']}
+    strategies = {k: results.get(k, {}).get('strategies', {}) for k in ['Close']}
 
     # Breakout
     breakout_signals = [s.get('breakout', {}).get('signal') for s in strategies.values()]
@@ -2101,13 +2039,18 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
 
     # Mean Reversion
     mean_rev = [s.get('mean_reversion', {}).get('signal') for s in strategies.values()]
-    if any("long" in str(sig).lower() for sig in mean_rev):
+    if any(str(sig) == "buy_revert" for sig in mean_rev):
         bull_score += WEIGHTS["mean_reversion"]
-        reasons.append("Mean-reversion signals (RSI oversold / lower band / negative z-score) — likely bounce to the mean; buy opportunity.")
+        reasons.append(
+            "Mean-reversion signals (RSI oversold / lower band / negative z-score) — likely bounce to the mean; buy opportunity."
+        )
         strategiesInfluenced.append("Mean Reversion")
-    if any("short" in str(sig).lower() for sig in mean_rev):
+
+    if any(str(sig) == "sell_revert" for sig in mean_rev):
         bear_score += WEIGHTS["mean_reversion"]
-        reasons.append("Mean-reversion signals (RSI overbought / upper band / high z-score) — likely pullback to the mean; caution for longs.")
+        reasons.append(
+            "Mean-reversion signals (RSI overbought / upper band / high z-score) — likely pullback to the mean; caution for longs."
+        )
         strategiesInfluenced.append("Mean Reversion")
 
     # Fibonacci
@@ -2115,15 +2058,20 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
     near = fib.get('near_level')
     dist = fib.get('distance', None)
     levels = fib.get('levels', {})
-    if near == '61.8%' and dist is not None and dist < 2:
+    if near in ["61.8%", "50%", "38.2%"] and dist is not None and dist < 2:
         bull_score += WEIGHTS["fibonacci"]
-        lvl = levels.get('61.8%', None)
-        reasons.append(f"Price is within {dist:.2f} of 61.8% Fibonacci ({lvl:.2f}) — common support zone; watch for bounce.")
+        lvl_val = levels.get(near)
+        reasons.append(
+            f"Price is within {dist:.2f} of {near} Fibonacci ({lvl_val:.2f}) — common support zone; watch for bounce."
+        )
         strategiesInfluenced.append("Fibonacci Tracement")
-    if near == '0%' and dist is not None and dist < 2:
+
+    if near == "0%" and dist is not None and dist < 2:
         bear_score += WEIGHTS["fibonacci"]
-        lvl = levels.get('0%', None)
-        reasons.append(f"Price is within {dist:.2f} of Fibonacci 0% (swing high {lvl:.2f}) — strong resistance; likely rejection.")
+        lvl_val = levels.get("0%")
+        reasons.append(
+            f"Price is within {dist:.2f} of Fibonacci 0% (swing high {lvl_val:.2f}) — strong resistance; likely rejection."
+        )
         strategiesInfluenced.append("Fibonacci Tracement")
 
     # Price Action
@@ -2147,6 +2095,7 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
         bull_score += WEIGHTS["scalping"]
         reasons.append("Intraday: price above VWAP + rising volume — short-term buying momentum.")
         strategiesInfluenced.append("Scalping Helper")
+
     if any("short" in str(sig).lower() for sig in scalping):
         bear_score += WEIGHTS["scalping"]
         reasons.append("Intraday: price below VWAP + rising volume — short-term selling momentum.")
@@ -2157,11 +2106,11 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
     swing = strategies.get('Close', {}).get('swing', {})
     swing_sig = swing.get('signal', 'none')
     if swing_sig and swing_sig.lower() != "none":
-        if "long" in swing_sig.lower():
+        if "bullish" in swing_sig.lower():
             bull_score += WEIGHTS.get("price_action", 2)  # or give swing its own weight
             reasons.append("Swing strategy indicates long bias — market showing medium-term upward pressure.")
             strategiesInfluenced.append("Swing Analytics")
-        elif "short" in swing_sig.lower():
+        elif "bearish" in swing_sig.lower():
             bear_score += WEIGHTS.get("price_action", 2)
             reasons.append("Swing strategy indicates short bias — market showing medium-term downward pressure.")
             strategiesInfluenced.append("Swing Analytics")
@@ -2169,11 +2118,12 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
     # Regime
     regime = results.get('Close', {}).get('regime', None)
     if regime:
-        if regime.lower() == "high":
+        regime_lower = regime.lower()
+        if regime_lower == "high":
             bull_score += 1
             reasons.append("Market regime detected as HIGH volatility/uptrend — favorable for momentum strategies.")
             strategiesInfluenced.append("Regime Detection")
-        elif regime.lower() == "low":
+        elif regime_lower == "low":
             bear_score += 1
             reasons.append("Market regime detected as LOW volatility/downtrend — risk of sideways or falling market.")
             strategiesInfluenced.append("Regime Detection")
@@ -2213,8 +2163,8 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
 
     prediction_strength = abs(next_close - current_close) / max(current_close, 1e-9) * 100
     reasons.append(f"Ensemble predicts {('bullish' if next_close>current_close else 'bearish')} move of {prediction_strength:.2f}% (from {current_close:.2f} to {next_close:.2f}).")
-    # reasons.append(f"Next-candle forecast: O:{next_open:.2f} H:{next_high:.2f} L:{next_low:.2f} C:{next_close:.2f}.")
-    reasons.append(f"Next-candle forecast: C:{next_close:.2f}.")
+    reasons.append(f"Next-candle forecast: O:{next_open:.2f} H:{next_high:.2f} L:{next_low:.2f} C:{next_close:.2f}.")
+    # reasons.append(f"Next-candle forecast: C:{next_close:.2f}.")
     
      # --------------------
     # Confidence calculation (robust + interpretable)
@@ -2268,6 +2218,8 @@ def generate_trading_signal(json_data: Dict[str, Any], last_candle: pd.Series) -
     return {
         'signal': final_signal,
         'trend': market_trend,
+        "bull_score": bull_score,
+        "bear_score": bear_score,
         'confidence': confidence_str,
         'confidence_score': conf_pct,
         'reasons': reasons,
@@ -2287,16 +2239,16 @@ def ensure_dirs(base="outputs"):
     os.makedirs(os.path.join(base,"plots"), exist_ok=True)
     os.makedirs(os.path.join(base,"json"), exist_ok=True)
 
+from rich.panel import Panel
+
 def pretty_print_results(ticker: str, timeframe: str, results: dict, cfg: CLIConfig):
     if console:
-        console.rule(f"[bold cyan]Forecast Results — {ticker.upper()} ({timeframe})[/bold cyan]")
         table = Table(title="Next-step predictions (ensemble)", show_edge=False)
         table.add_column("Target")
         table.add_column("Prediction", justify="right")
         table.add_column("Top model weight", justify="right")
 
-        # for t in ["Open", "High", "Low", "Close"]:
-        for t in ["Close"]:
+        for t in ["Open", "High", "Low", "Close"]:
             if "error" in results[t]:
                 table.add_row(t, "[red]Error[/red]", results[t]["error"])
                 continue
@@ -2306,7 +2258,6 @@ def pretty_print_results(ticker: str, timeframe: str, results: dict, cfg: CLICon
 
             # Format ensemble predictions safely
             if isinstance(ens, dict):
-                # Only show first 5 predictions to avoid huge strings
                 ens_str = ", ".join(f"{v:.4f}" for v in list(ens.values())[:5])
             elif isinstance(ens, (list, np.ndarray)):
                 ens_str = ", ".join(f"{v:.4f}" for v in ens[:5])
@@ -2327,14 +2278,13 @@ def pretty_print_results(ticker: str, timeframe: str, results: dict, cfg: CLICon
 
             table.add_row(t, ens_str, top_str)
 
-        console.print(table)
+        # 👇 Wrap the table in a Panel for better display
+        panel = Panel(table, title="📊 Forecast Summary", border_style="cyan", padding=(1, 2))
+        console.print(panel)
 
-        # console.print("\n[bold]Strategy highlights per target:[/bold]")
-        # for t in ["Open", "High", "Low", "Close"]:
-        #     strat = results[t].get("strategies", {})
-        #     console.print(f"[cyan]{t}[/cyan] → {json.dumps(strat, default=str)}")
     else:
         print(json.dumps(results, indent=2, default=str))
+
 
 def save_outputs(ticker: str, timeframe: str, df: pd.DataFrame, results: Dict[str, Any], cfg: CLIConfig):
     ensure_dirs(cfg.output_dir)
@@ -2368,39 +2318,72 @@ def save_outputs(ticker: str, timeframe: str, df: pd.DataFrame, results: Dict[st
         json.dump(out_json, f, indent=2, default=float)
 
     # Plotting
+    # Plotting - Professional Dashboard Style
     try:
-        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-        ax.plot(df.index, df["Close"], label="Close (historical)", linewidth=1)
-        ax.scatter(df.index[-1], df["Close"].iloc[-1], color="black", s=30, label="Last")
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+
+        # Historical Close
+        ax.plot(df.index, df["Close"], label="Close (historical)", color="black", linewidth=1.5)
+
+        # Last Close Marker
+        ax.scatter(df.index[-1], df["Close"].iloc[-1], color="black", s=50, label="Last Close")
 
         close_res = results.get("Close", {})
 
-        # Plot ensemble prediction safely
-        next_preds = close_res.get("next_preds", {})
+        # Define colors for models
+        model_colors = ["red", "blue", "green", "orange", "purple", "brown", "cyan"]
+
+        # Plot predictions for all models
+        next_preds = close_res.get("adjusted_preds", {})
+        for i, (model_name, pred_val) in enumerate(next_preds.items()):
+            if isinstance(pred_val, (int, float)) and len(df.index) > 1:
+                delta = df.index[-1] - df.index[-2]
+                next_time = df.index[-1] + delta
+                ax.scatter([next_time], [pred_val], color=model_colors[i % len(model_colors)],
+                        s=60, label=f"{model_name} Prediction: {pred_val:.4f}", marker="X")
+
+        # Ensemble prediction highlight
         ens = next_preds.get("ENSEMBLE")
         if isinstance(ens, (int, float)) and len(df.index) > 1:
             delta = df.index[-1] - df.index[-2]
             next_time = df.index[-1] + delta
-            ax.scatter([next_time], [ens], color="red", s=50, label=f"Ensemble next: {ens:.4f}")
+            ax.scatter([next_time], [ens], color="magenta", s=80, label=f"Ensemble next: {ens:.4f}", marker="D")
         elif ens is not None:
-            logger.warning(f"Skipping ensemble plot for {ticker}: ENSEMBLE is not numeric ({ens})")
+            pass
+            # logger.warning(f"Skipping ensemble plot for {ticker}: ENSEMBLE is not numeric ({ens})")
 
-        # Plot strategy annotations safely
+        # Strategy Annotations
         strat = close_res.get("strategies", {})
         breakout_signal = strat.get("breakout", {}).get("signal")
         if breakout_signal == "bullish":
             ax.annotate(
-                "Breakout (bull)",
+                "Breakout (Bullish)",
                 xy=(df.index[-1], df["Close"].iloc[-1]),
-                xytext=(0, 20),
+                xytext=(0, 25),
                 textcoords="offset points",
-                arrowprops=dict(arrowstyle="->", color="green")
+                arrowprops=dict(arrowstyle="->", color="green", lw=2),
+                fontsize=10,
+                fontweight="bold"
+            )
+        elif breakout_signal == "bearish":
+            ax.annotate(
+                "Breakout (Bearish)",
+                xy=(df.index[-1], df["Close"].iloc[-1]),
+                xytext=(0, 25),
+                textcoords="offset points",
+                arrowprops=dict(arrowstyle="->", color="red", lw=2),
+                fontsize=10,
+                fontweight="bold"
             )
 
-        ax.set_title(f"{ticker.upper()} {timeframe} — Close & forecast")
-        ax.legend()
-        ax.grid(alpha=0.2)
+        # Title, grid, and legend
+        ax.set_title(f"{ticker.upper()} {timeframe} — Close & Forecast", fontsize=14, fontweight="bold")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price ($)")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best", fontsize=9)
         fig.autofmt_xdate()
+        fig.tight_layout()
 
         # Save plot
         plot_path = os.path.join(cfg.output_dir, "plots", f"{ticker}_{timeframe}_{ts}.png")
@@ -2451,6 +2434,7 @@ def _run_predict(ticker: str,
         output_dir="outputs",
         quiet=quiet
     )
+    start_time = time.perf_counter()
     if console and not quiet:
         console.print(Panel.fit(f"[bold green]AlphaFusion Finance[/bold green] — {cfg.ticker.upper()} — {cfg.timeframe}"))
     if console and not quiet:
@@ -2467,10 +2451,15 @@ def _run_predict(ticker: str,
         df = fetch_last_candles(ticker, timeframe, candles)
 
     results = predict_all_ohlcv(df, cfg)
+    # print("\n")
     json_path = save_outputs(ticker, timeframe, df, results, cfg)
     if console and not quiet:
         console.print(f"[green]Saved JSON →[/green] {json_path}")
     pretty_print_results(ticker, timeframe, results, cfg)
+    end_time = time.perf_counter()
+    elapsed = end_time - start_time
+    console.print(f"[bold green]✅ Finished Prediction![/bold green] "
+                        f"(took [yellow]{elapsed:.2f}[/yellow]s)\n")
 
 
 # -------------------------
