@@ -34,6 +34,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import Manager, Queue
 from tqdm import tqdm
 import threading
+from hmmlearn.hmm import GaussianHMM
 
 import warnings
 
@@ -126,11 +127,18 @@ try:
 except ImportError:
     optuna = None
 
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+import torch
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import MAE
+from pytorch_lightning import Trainer
+from pytorch_forecasting.models import NBeats
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
@@ -172,14 +180,7 @@ PERIOD_FOR_INTERVAL = {
     "1d": ("5y", "1d"),
 }
 
-def make_progress_table(progress_bars):
-    table = Table.grid(expand=True)
-    table.add_column(justify="left", ratio=1)
-    for target, bar in progress_bars.items():
-        # Capture current state of tqdm bar
-        bar_str = str(bar)
-        table.add_row(bar_str)
-    return Panel(table, title="Forecast Progress", border_style="cyan")
+
 
 # -------------------------
 # Datetime sanitizers
@@ -432,13 +433,6 @@ def inverse_error_weights(y_true: np.ndarray, preds_dict: Dict[str, np.ndarray])
 # -------------------------
 # Models
 # -------------------------
-def ema_baseline(series: pd.Series, span:int, val_horizon: int):
-    s = series.dropna().astype(float)
-    ema_s = ema(s, span)
-    preds = ema_s.shift(1).values[-val_horizon:]
-    next_step = float(ema_s.iloc[-1])
-    return np.array(preds, dtype=float), float(next_step)
-
 def sarimax_small_grid_forecast(train_series: pd.Series, val_horizon: int, exog: Optional[pd.DataFrame]=None,
                                 max_p=2, max_d=1, max_q=2, seasonal=False, m=1, max_fits=20, maxiter=100):
     """
@@ -540,29 +534,6 @@ def sarimax_small_grid_forecast(train_series: pd.Series, val_horizon: int, exog:
 
     return np.array(fc, dtype=float), best_model if best_model else None
 
-def prophet_forecast(train_df: pd.Series, val_horizon: int, freq: str = 'D'):
-    if Prophet is None:
-        raise RuntimeError("Prophet not installed")
-
-    # Ensure tz-naive datetime index
-    idx = pd.to_datetime(train_df.index)
-    if getattr(idx, 'tz', None) is not None:
-        idx = idx.tz_convert('UTC').tz_localize(None) if idx.tz else idx.tz_localize(None)
-
-    dfp = pd.DataFrame({"ds": idx, "y": train_df.values.astype(float)})
-    dfp = dfp.sort_values('ds').reset_index(drop=True)
-
-    # Optionally interpolate missing dates
-    dfp = dfp.set_index('ds').asfreq(freq).interpolate().reset_index()
-
-    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
-    m.fit(dfp)
-
-    future = m.make_future_dataframe(periods=val_horizon, freq=freq)
-    fc = m.predict(future)
-    preds = fc["yhat"].values[-val_horizon:]
-    return np.array(preds, dtype=float), m
-
 def xgboost_forecast(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -663,22 +634,156 @@ def build_cnn_lstm(input_shape, conv_filters=32, conv_kernel=3, lstm_units=64, d
     model.compile(optimizer="adam", loss="mse")
     return model
 
-def build_attention_lstm(input_shape, lstm_units=64, dropout_rate=0.2):
-    """
-    Build Attention-LSTM model for multi-feature price prediction.
-    """
-    inp = Input(shape=input_shape)
-    x = LSTM(lstm_units, return_sequences=True)(inp)
-    x = Attention()([x, x])  # self-attention
-    x = LSTM(lstm_units//2)(x)
-    x = Dropout(dropout_rate)(x)
-    out = Dense(1, activation='linear')(x)
-    model = Model(inp, out)
-    model.compile(optimizer="adam", loss="mse")
-    return model
+def run_tft_forecast(series: pd.Series, features_df: pd.DataFrame, cfg):
+    """Train TFT safely for small datasets with HMM/volatility regimes."""
+    df = features_df.copy()
+    df['target'] = series.values
+    df['time_idx'] = np.arange(len(df))
+    df['group'] = 'ticker'
+    df['hmm_regime'] = df['hmm_regime'].astype(str)
+
+    max_encoder_length = min(60, cfg.candles // 3, len(df) - cfg.val_horizon - 1)
+    max_prediction_length = min(cfg.forecast_horizon, len(df) - 1)
+    if len(df) <= max_encoder_length + max_prediction_length:
+        raise ValueError("Not enough rows for encoder + prediction")
+
+    dataset = TimeSeriesDataSet(
+        df,
+        time_idx='time_idx',
+        target='target',
+        group_ids=['group'],
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        time_varying_known_categoricals=['hmm_regime'],
+        time_varying_known_reals=[c for c in df.columns if c not in ['target','group','time_idx','hmm_regime']],
+        time_varying_unknown_reals=['target'],
+        target_normalizer=GroupNormalizer(groups=['group'], transformation='softplus'),
+        add_relative_time_idx=True,
+    )
+
+    val_h = max(1, min(cfg.val_horizon, len(df)//5))
+    train_df = df.iloc[:-val_h]
+    val_df = df.iloc[-val_h:]
+
+    # Cap encoder length for validation dataset
+    max_encoder_length_val = 18
+    val_dataset_temp = TimeSeriesDataSet(
+        val_df,
+        time_idx='time_idx',
+        target='target',
+        group_ids=['group'],
+        max_encoder_length=max_encoder_length_val,
+        max_prediction_length=max_prediction_length,
+        time_varying_known_categoricals=['hmm_regime'],
+        time_varying_known_reals=[c for c in val_df.columns if c not in ['target','group','time_idx','hmm_regime']],
+        time_varying_unknown_reals=['target'],
+        target_normalizer=GroupNormalizer(groups=['group'], transformation='softplus'),
+    )
+
+    train_dataset = TimeSeriesDataSet.from_dataset(dataset, data=train_df)
+    val_dataset = TimeSeriesDataSet.from_dataset(val_dataset_temp, data=val_df)
+
+    train_loader = train_dataset.to_dataloader(train=True, batch_size=16)
+    val_loader = val_dataset.to_dataloader(train=False, batch_size=16)
+
+    tft = TemporalFusionTransformer.from_dataset(
+        train_dataset,
+        learning_rate=0.03,
+        hidden_size=32,
+        attention_head_size=4,
+        dropout=0.1,
+        hidden_continuous_size=16,
+        output_size=1,
+        loss=MAE(),
+    )
+
+    trainer = Trainer(max_epochs=cfg.lstm_epochs, logger=False, enable_checkpointing=False)
+    trainer.fit(tft, train_loader, val_loader)
+
+    val_predictions = tft.predict(val_loader).flatten()[:val_h]
+
+    last_encoder_data = df.iloc[-max_encoder_length:].copy()
+    if len(last_encoder_data) < max_encoder_length:
+        pad_n = max_encoder_length - len(last_encoder_data)
+        last_encoder_data = pd.concat([last_encoder_data.iloc[:1].repeat(pad_n), last_encoder_data])
+
+    future_predictions = tft.predict(last_encoder_data, mode='prediction').flatten()[:cfg.forecast_horizon]
+
+    return np.array(val_predictions), np.array(future_predictions)
 
 
-# -------------------------
+def run_nbeats_forecast(series: pd.Series, features_df: pd.DataFrame, cfg):
+    """Train N-BEATS safely for small datasets (univariate only)."""
+    df = features_df.copy()
+    df['target'] = series.values
+    df['time_idx'] = np.arange(len(df))
+    df['group'] = 'ticker'
+
+    max_encoder_length = min(60, cfg.candles // 3, len(df) - cfg.val_horizon - 1)
+    max_prediction_length = min(cfg.forecast_horizon, len(df) - 1)
+    if len(df) <= max_encoder_length + max_prediction_length:
+        raise ValueError("Not enough rows for encoder + prediction")
+
+    # N-BEATS requires univariate input
+    dataset = TimeSeriesDataSet(
+        df,
+        time_idx='time_idx',
+        target='target',
+        group_ids=['group'],
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        time_varying_unknown_reals=['target'],
+        target_normalizer=GroupNormalizer(groups=['group'], transformation='softplus'),
+    )
+
+    val_h = max(1, min(cfg.val_horizon, len(df)//5))
+    train_df = df.iloc[:-val_h]
+    val_df = df.iloc[-val_h:]
+
+    # Validation dataset for N-BEATS
+    max_encoder_length_val = 18
+    val_dataset_temp = TimeSeriesDataSet(
+        val_df,
+        time_idx='time_idx',
+        target='target',
+        group_ids=['group'],
+        max_encoder_length=max_encoder_length_val,
+        max_prediction_length=max_prediction_length,
+        time_varying_unknown_reals=['target'],
+        target_normalizer=GroupNormalizer(groups=['group'], transformation='softplus'),
+    )
+
+    train_dataset = TimeSeriesDataSet.from_dataset(dataset, data=train_df)
+    val_dataset = TimeSeriesDataSet.from_dataset(val_dataset_temp, data=val_df)
+
+    train_loader = train_dataset.to_dataloader(train=True, batch_size=16)
+    val_loader = val_dataset.to_dataloader(train=False, batch_size=16)
+
+    nbeats = NBeats.from_dataset(
+        train_dataset,
+        learning_rate=0.03,
+        width=32,
+        backcast_length=max_encoder_length,
+        forecast_length=max_prediction_length,
+        loss=MAE(),
+    )
+
+    trainer = Trainer(max_epochs=cfg.lstm_epochs, logger=False, enable_checkpointing=False)
+    trainer.fit(nbeats, train_loader, val_loader)
+
+    val_predictions = nbeats.predict(val_loader).flatten()[:val_h]
+
+    last_encoder_data = df.iloc[-max_encoder_length:].copy()
+    if len(last_encoder_data) < max_encoder_length:
+        pad_n = max_encoder_length - len(last_encoder_data)
+        last_encoder_data = pd.concat([last_encoder_data.iloc[:1].repeat(pad_n), last_encoder_data])
+
+    future_predictions = nbeats.predict(last_encoder_data, mode='prediction').flatten()[:cfg.forecast_horizon]
+
+    return np.array(val_predictions), np.array(future_predictions)
+
+
+#-------------------------
 # Walk-forward CV helpers
 # -------------------------
 def walk_forward_splits(n: int, initial_train: int, step: int, val_horizon: int):
@@ -983,6 +1088,96 @@ def fetch_options_flow_stub(ticker: str):
     return out
 
 
+def add_hl_vol(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add High-Low volatility proxy (hl_vol) to DataFrame.
+    hl_vol = (High - Low) / Close
+    """
+    df = df.copy()
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        raise ValueError("DataFrame must contain High, Low, and Close columns")
+    df["hl_vol"] = (df["High"] - df["Low"]) / df["Close"]
+    return df
+
+
+def compute_hmm_regimes(df: pd.DataFrame, n_states: int = 3, seed: int = 42) -> pd.Series:
+    """
+    Fit Gaussian HMM to returns + volatility features and return regime states.
+    """
+    df = df.copy()
+
+    # Features for HMM
+    df["returns"] = df["Close"].pct_change().fillna(0)
+    df["log_ret"] = np.log(df["Close"]).diff().fillna(0)
+
+    if "hl_vol" not in df.columns:
+        df = add_hl_vol(df)
+
+    features = df[["returns", "log_ret", "hl_vol"]].values
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+
+    hmm = GaussianHMM(
+        n_components=n_states, covariance_type="full",
+        random_state=seed, n_iter=500
+    )
+    hmm.fit(features_scaled)
+
+    hidden_states = hmm.predict(features_scaled)
+    return pd.Series(hidden_states, index=df.index, name="hmm_regime")
+
+
+def label_hmm_regimes_robust(df: pd.DataFrame, regime_col: str = "hmm_regime") -> pd.Series:
+    """
+    Map numeric HMM regimes → financial labels using mean returns + volatility.
+    """
+    if not {"returns", "hl_vol", regime_col}.issubset(df.columns):
+        raise ValueError("DataFrame must contain 'returns', 'hl_vol', and regime column.")
+
+    summary = df.groupby(regime_col).agg(
+        mean_return=("returns", "mean"),
+        volatility=("hl_vol", "mean")
+    )
+
+    labels = {}
+    for regime, row in summary.iterrows():
+        ret, vol = row["mean_return"], row["volatility"]
+
+        if ret > 0.001:  # Upward trend
+            if vol > summary["volatility"].median():
+                labels[regime] = "high-vol bull"
+            else:
+                labels[regime] = "low-vol bull"
+        elif ret < -0.001:  # Downward trend
+            if vol > summary["volatility"].median():
+                labels[regime] = "high-vol bear"
+            else:
+                labels[regime] = "low-vol bear"
+        else:  # Near flat
+            labels[regime] = "sideways"
+
+    return df[regime_col].map(labels).rename("regime_label")
+
+
+def add_market_regimes(df: pd.DataFrame, n_states: int = 3, seed: int = 42) -> pd.DataFrame:
+    """
+    Full pipeline: compute hl_vol, hmm_regime, and human-readable regime labels.
+    """
+    df = df.copy()
+
+    # Ensure required features
+    df = add_hl_vol(df)
+    df["returns"] = df["Close"].pct_change().fillna(0)
+
+    # Step 1: Compute HMM regimes
+    df["hmm_regime"] = compute_hmm_regimes(df, n_states=n_states, seed=seed)
+
+    # Step 2: Map to financial labels
+    df["regime_label"] = label_hmm_regimes_robust(df, regime_col="hmm_regime")
+
+    return df
+
+
 # -------------------------
 # Rich Keras callback for epoch logging & ml training
 # -------------------------
@@ -1157,42 +1352,6 @@ def train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, 
 
     return model
 
-def train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None, target_name=None, progress_queue=None):
-    model = build_attention_lstm((lookback, n_features), lstm_units=128, dropout_rate=0.2)
-
-    class QueueLogger(Callback):
-        def __init__(self, total_epochs, target_name, progress_queue):
-            super().__init__()
-            self.total_epochs = total_epochs
-            self.target_name = target_name
-            self.progress_queue = progress_queue
-
-        def on_epoch_end(self, epoch, logs=None):
-            if self.progress_queue:
-                loss = logs.get("loss", 0.0)
-                val_loss = logs.get("val_loss", 0.0)
-                self.progress_queue.put({
-                        "target": self.target_name,
-                        "status": f"LSTM epoch {epoch+1}/{self.total_epochs} "
-                                f"loss={loss:.4f} val_loss={val_loss:.4f}"
-                    })
-
-    callbacks = []
-    if 'EarlyStopping' in globals():
-        callbacks.append(EarlyStopping(monitor='loss', patience=5, restore_best_weights=True))
-    callbacks.append(QueueLogger(cfg.lstm_epochs, target_name, progress_queue))
-
-    model.fit(
-        X_seq_train, y_seq_train_scaled,
-        validation_data=(X_seq_val, y_seq_val_scaled) if X_seq_val is not None else None,
-        epochs=cfg.lstm_epochs,
-        batch_size=cfg.lstm_batch,
-        callbacks=callbacks,
-        verbose=0
-    )
-
-    return model
-
 
 
 # -------------------------
@@ -1202,468 +1361,168 @@ def forecast_univariate(series: pd.Series,
                         features_df: pd.DataFrame,
                         cfg: CLIConfig,
                         target_name: str = "Close",
-                        progress_queue: Queue = None):  # <-- new param
-    val_h = cfg.val_horizon  # use dynamic horizon
-    forecast_h = cfg.forecast_horizon
+                        progress_queue: Queue = None):
+    """
+    Run ensemble forecasts (LSTM, TFT, N-BEATS, XGB residuals) for a single target.
+    Handles categorical regimes, numeric features, scaling, and future timestamps.
+    Returns next_preds, metrics, model weights, and strategy indicators.
+    """
 
-    # Align and sanitize indices
+    # ------------------ Preprocessing ------------------
+    df = features_df.copy()
+
+    # Handle HMM/Volatility regimes as categorical
+    if "hmm_regime" in df.columns:
+        df["hmm_regime"] = df["hmm_regime"].astype(str)
+    if "regime_label" in df.columns and df["regime_label"].dtype == "object":
+        regime_map = {
+            "low-vol bull": "0", "high-vol bull": "1",
+            "low-vol bear": "2", "high-vol bear": "3",
+            "sideways": "4"
+        }
+        df["regime_label"] = df["regime_label"].map(regime_map).astype(str)
+
+    # Ensure numeric features are numeric
+    numeric_cols = [c for c in df.columns if c not in ["hmm_regime", "regime_label"]]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.dropna(subset=numeric_cols, inplace=True)
+
+    # Align series and features
     series = _ensure_series_has_datetime_index(series)
-    features_df.index = _ensure_datetime_index_tz_naive(features_df.index)
+    df.index = _ensure_datetime_index_tz_naive(df.index)
+    df, series = df.align(series, join="inner", axis=0)
+    df = df.dropna()
+    series = series.loc[df.index]
 
-    features_df, series = features_df.align(series, join="inner", axis=0)
-    features_df = features_df.dropna()
-    series = series.loc[features_df.index].dropna()
+    val_h = cfg.val_horizon
+    forecast_h = cfg.forecast_horizon
     if len(series) < val_h + 20:
-        raise ValueError("Not enough data after indicators for training/validation")
+        raise ValueError("Not enough data after preprocessing for training/validation")
 
     n_total = len(series)
     n_train = n_total - val_h
     train_series = series.iloc[:n_train]
 
-    # EMA baseline
-    try:
-        if progress_queue: 
-            progress_queue.put({"target": target_name, "status": "Running EMA..."})
-        ema_val_preds, ema_next = ema_baseline(series, span=max(12, cfg.candles//3), val_horizon=val_h)
-        ema_forecast = np.repeat(ema_next, forecast_h)
-    except Exception as e:
-        logger.warning(f"{target_name} EMA failed: {e}")
-
-    # SARIMAX
-    try:
-        if progress_queue: progress_queue.put({"target": target_name, "status": "Running SARIMAX..."})
-        sarima_preds, sarima_model = sarimax_small_grid_forecast(
-            train_series, val_h, seasonal=False
-        )
-        sarima_next = float(sarima_preds[-1]) if len(sarima_preds) > 0 else float(train_series.iloc[-1])
-        sarima_forecast_preds, _ = sarimax_small_grid_forecast(
-            series, forecast_h, seasonal=False
-        )
-    except Exception as e:
-        logger.warning(f"{target_name} SARIMAX failed: {e}")
-    
-    # Prophet
-    prophet_preds = None
-    if cfg.use_prophet and Prophet is not None:
-        try:
-            if progress_queue: progress_queue.put({"target": target_name, "status": "Running Prophet..."})
-            prophet_preds, prophet_model = prophet_forecast(train_series, val_h)
-        except Exception as e:
-            logger.warning(f"Prophet failed: {e}")
-            prophet_preds = None
-    prophet_forecast_preds = None
-    if cfg.use_prophet and Prophet is not None:
-        try:
-            prophet_forecast_preds, prophet_model_full = prophet_forecast(series, forecast_h)
-        except Exception as e:
-            logger.warning(f"Prophet forward failed: {e}")
-            prophet_forecast_preds = None
-
-    # Prepare tabular features for XGBoost/LSTM: fit scalers on train only
-    features = features_df.copy()
-    X_all = features.values.astype(float)
-    y_all = series.values.astype(float)
-
-
-    # Fit scaler on training rows only
+    # Scale numeric features
+    X_all = df[numeric_cols].values.astype(float)
     scaler_X = RobustScaler()
     scaler_X.fit(X_all[:n_train])
     X_scaled_full = scaler_X.transform(X_all)
-    
-     # ----------------- Tree Models: RF, LGBM -----------------
-    X_tab_train = X_scaled_full[:n_train]
-    y_tab_train = y_all[:n_train]
-    X_tab_val   = X_scaled_full[n_train:n_train+val_h]
-    
-    tree_model_fns = []
-    if cfg.use_random_forest:
-        def rf_fn(X_tab_train, y_tab_train, X_tab_val):
-            if progress_queue: progress_queue.put({"target": target_name, "status": "Running RandomForest..."})
-            params_rf = {
-                "n_estimators": getattr(cfg, "rf_n_estimators", 300),
-                "max_depth": getattr(cfg, "rf_max_depth", None),
-                "min_samples_leaf": getattr(cfg, "rf_min_samples_leaf", 1),
-            }
-            preds_val, model = train_random_forest_v51(
-                X_tab_train, y_tab_train, X_tab_val, params=params_rf
-            )
-            return preds_val, model   # ✅ return both
-        tree_model_fns.append(rf_fn)
 
-    if cfg.use_lightgbm and lgb:
-        def lgb_fn(X_tab_train, y_tab_train, X_tab_val):
-            if progress_queue: progress_queue.put({"target": target_name, "status": "Running LightGBM..."})
-            params_lgb = {
-                "n_estimators": getattr(cfg, "lgb_n_estimators", 500),
-                "learning_rate": getattr(cfg, "lgb_learning_rate", 0.05),
-                "max_depth": getattr(cfg, "lgb_max_depth", -1),
-                "num_leaves": getattr(cfg, "lgb_num_leaves", 31),
-                "verbose": -1
-            }
-            preds_val, booster = train_lightgbm_v51(
-                X_tab_train, y_tab_train, X_tab_val, params=params_lgb
-            )
-            return preds_val, booster   # ✅ return both
-        tree_model_fns.append(lgb_fn)
+    y_all = series.values.astype(float)
+    y_train = y_all[:n_train].reshape(-1, 1)
+    scaler_y = RobustScaler()
+    scaler_y.fit(y_train)
 
-
-    # Generate OOF predictions and train meta-learner
-    preds_by_tree_model, forecast_by_tree_model, tree_metrics, tree_weights = {}, {}, {}, {}
-    if tree_model_fns:
-        oof = generate_oof_predictions_v51(tree_model_fns, X_scaled_full, y_all, max(int(n_total*0.5),200), val_h, val_h)
-        meta_learner = train_meta_learner_v51(oof, y_all)
-        for i, fn in enumerate(tree_model_fns):
-            try:
-                _, mdl = fn(X_scaled_full, y_all, None)
-                last_feat = np.repeat(X_scaled_full[-1:], forecast_h, axis=0)
-                forecast_by_tree_model[f"MODEL_{i}"] = mdl.predict(last_feat)
-                preds_by_tree_model[f"MODEL_{i}"] = mdl.predict(X_scaled_full[-val_h:])
-            except Exception as e:
-                logger.warning(f"Failed: {e}")
-                preds_by_tree_model[f"MODEL_{i}"] = np.repeat(y_all[-1], val_h)
-                forecast_by_tree_model[f"MODEL_{i}"] = np.repeat(y_all[-1], forecast_h)
-
-        if progress_queue: progress_queue.put({"target": target_name, "status": "Running MetaLearner..."})
-        stack_for_forecast = np.vstack([forecast_by_tree_model[k] for k in sorted(forecast_by_tree_model.keys())]).T
-        ensemble_forecast_tree = meta_learner.predict(stack_for_forecast)
-        preds_by_tree_model["ENSEMBLE_META"] = np.repeat(ensemble_forecast_tree[0], val_h)
-        forecast_by_tree_model["ENSEMBLE_META"] = ensemble_forecast_tree
-
-
-    # XGBoost
-    xgb_preds, xgb_forecast, xgb_model_obj = None, None, None
-
-    if cfg.use_xgboost and xgb is not None:
+    # ------------------ LSTM / Sequence Models ------------------
+    lstm_preds, lstm_forecast = None, None
+    if cfg.use_lstm:
         try:
-            # Validation phase
-            if progress_queue: progress_queue.put({"target": target_name, "status": "Running XGBoost..."})
-            X_tab_train = X_scaled_full[:n_train]
-            y_tab_train = y_all[:n_train]
-            X_tab_val   = X_scaled_full[n_train:n_train+val_h]
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running LSTM..."})
+            lookback = min(60, max(10, cfg.candles // 3))
+            n_seq = X_scaled_full.shape[0] - lookback
+            X_seq = np.array([X_scaled_full[i:i+lookback] for i in range(n_seq)], dtype=float)
+            y_seq = y_all[lookback:]
 
-            xgb_preds, _, _ = xgboost_forecast(X_tab_train, y_tab_train, X_val=X_tab_val)
+            last_train_idx = n_train - lookback
+            X_seq_train, y_seq_train = X_seq[:last_train_idx], y_seq[:last_train_idx]
+            X_seq_val, y_seq_val = X_seq[last_train_idx:last_train_idx+val_h], y_seq[last_train_idx:last_train_idx+val_h]
 
-            # Forecast phase (refit on full data)
-            X_tab_full = X_scaled_full
-            y_tab_full = y_all
+            # Pad if necessary
+            if X_seq_val.shape[0] < val_h:
+                pad_n = val_h - X_seq_val.shape[0]
+                X_seq_val = np.vstack([np.repeat(X_seq_val[-1:], pad_n, axis=0), X_seq_val])
+                y_seq_val = np.concatenate([np.repeat(y_seq_val[-1], pad_n), y_seq_val])
 
-            if "features_future" not in locals() or features_future is None:
-            # fallback: repeat last row of features
-                features_future = np.repeat(X_scaled_full[-1:], forecast_h, axis=0)
+            # Scale targets
+            y_seq_train_scaled = scaler_y.transform(y_seq_train.reshape(-1,1)).reshape(-1)
+            y_seq_val_scaled = scaler_y.transform(y_seq_val.reshape(-1,1)).reshape(-1)
 
-            _, xgb_forecast, xgb_model_obj = xgboost_forecast(
-                X_tab_full, y_tab_full, X_future=features_future)
-            
-            if xgb_forecast is None:
-                # fallback if no future features
-                xgb_forecast = np.repeat(float(y_tab_full[-1]), forecast_h)
-
+            lstm_model = train_lstm_model(
+                X_seq_train, y_seq_train_scaled,
+                lookback, X_seq.shape[2],
+                cfg, scaler_y,
+                X_seq_val, y_seq_val_scaled,
+                target_name, progress_queue
+            )
+            preds_scaled = lstm_model.predict(X_seq_val).reshape(-1)
+            lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
+            lstm_forecast = recursive_lstm_forecast(
+                lstm_model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y
+            )
         except Exception as e:
-            logger.warning(f"XGBoost failed: {e}")
-            xgb_preds, xgb_forecast = None, None
+            logger.warning(f"LSTM failed: {e}")
+        finally:
+            K.clear_session(); gc.collect()
 
+    # ------------------ TFT ------------------
+    tft_preds, tft_forecast = None, None
+    if cfg.use_lstm:
+        try:
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running TFT..."})
+            tft_preds, tft_forecast = run_tft_forecast(series, df, cfg)
+        except Exception as e:
+            logger.warning(f"TFT failed: {e}")
 
-    # LSTM: robust multi-step sequence creation & scaling
-    lstm_preds = lstm_forecast = None
-    cnn_lstm_preds, cnn_lstm_forecast = None, None
-    attn_lstm_preds, attn_lstm_forecast = None, None
+    # ------------------ N-BEATS ------------------
+    nbeats_preds, nbeats_forecast = None, None
+    if cfg.use_lstm:
+        try:
+            if progress_queue: progress_queue.put({"target": target_name, "status": "Running N-BEATS..."})
+            nbeats_preds, nbeats_forecast = run_nbeats_forecast(series, df, cfg)
+        except Exception as e:
+            logger.warning(f"N-BEATS failed: {e}")
 
-    if cfg.use_lstm or cfg.use_cnn_lstm or cfg.use_attention_lstm:
-        if tf is None:
-            logger.warning("LSTM requested but TensorFlow not installed; skipping LSTM.")
-        else:
-            try:
-                # 1. Scale features
-                X_all = features_df.values.astype(float)
-                scaler_X = RobustScaler()
-                scaler_X.fit(X_all[:n_train])
-                X_scaled_full = scaler_X.transform(X_all)
-
-                # 2. Scale target
-                y_all_float = series.values.astype(float)
-                y_train = y_all_float[:n_train].reshape(-1, 1)
-                scaler_y = RobustScaler()
-                scaler_y.fit(y_train)
-
-                # 3. Build sequences
-                lookback = min(60, max(10, cfg.candles // 3))
-                n_seq = X_scaled_full.shape[0] - lookback
-                if n_seq <= 0:
-                    raise RuntimeError("Not enough rows to build sequences for LSTM")
-
-                X_seq = np.array([X_scaled_full[i:i+lookback] for i in range(n_seq)], dtype=float)
-                y_seq = y_all_float[lookback:]  # aligned with X_seq
-
-                # 4. Split sequences into train and validation
-                last_train_seq_index = n_train - lookback
-                if last_train_seq_index <= 0:
-                    raise RuntimeError("Not enough sequence training rows for LSTM after lookback")
-
-                X_seq_train = X_seq[:last_train_seq_index]
-                y_seq_train = y_seq[:last_train_seq_index]
-
-                X_seq_val = X_seq[last_train_seq_index:last_train_seq_index + val_h]
-                y_seq_val = y_seq[last_train_seq_index:last_train_seq_index + val_h]
-
-                # pad validation if smaller than val_h
-                if X_seq_val.shape[0] < val_h:
-                    pad_n = val_h - X_seq_val.shape[0]
-                    X_seq_val = np.vstack([np.repeat(X_seq_val[-1:], pad_n, axis=0), X_seq_val])
-                    y_seq_val = np.concatenate([np.repeat(y_seq_val[-1], pad_n), y_seq_val])
-
-                # 5. Scale y sequences
-                y_seq_train_scaled = scaler_y.transform(y_seq_train.reshape(-1, 1)).reshape(-1)
-                y_seq_val_scaled = scaler_y.transform(y_seq_val.reshape(-1, 1)).reshape(-1)
-
-                if cfg.use_lstm:
-                    try:
-                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running Vanilla LSTM..."})
-                        
-                        model = train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                                X_seq_val, y_seq_val_scaled, target_name, progress_queue)
-                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                        lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                        model.fit(
-                            X_seq,
-                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
-                            epochs=max(1, cfg.lstm_epochs // 2),
-                            batch_size=cfg.lstm_batch,
-                            verbose=0
-                        )
-                        lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
-                    except Exception as e:
-                        logger.warning(f"Vanilla LSTM failed: {e}")
-                        lstm_preds, lstm_forecast = None, None
-
-                    finally:
-                        K.clear_session()
-                        gc.collect()
-
-                if cfg.use_cnn_lstm:
-                    try:
-                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running CNN LSTM..."})
-                        
-                        model = train_cnn_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                                    X_seq_val, y_seq_val_scaled, target_name, progress_queue)
-                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                        cnn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                        model.fit(
-                            X_seq,
-                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
-                            epochs=max(1, cfg.lstm_epochs // 2),
-                            batch_size=cfg.lstm_batch,
-                            verbose=0
-                        )
-                        cnn_lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
-                    except Exception as e:
-                        logger.warning(f"CNN LSTM failed: {e}")
-                        cnn_lstm_preds, cnn_lstm_forecast = None, None
-
-                    finally:
-                        K.clear_session()
-                        gc.collect()
-
-                if cfg.use_attention_lstm:
-                    try:
-                        if progress_queue: progress_queue.put({"target": target_name, "status": "Running Attention LSTM..."})
-                        
-                        model = train_attention_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], cfg, scaler_y,
-                                                        X_seq_val, y_seq_val_scaled, target_name, progress_queue)
-                        preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
-                        attn_lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
-                        model.fit(
-                            X_seq,
-                            scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
-                            epochs=max(1, cfg.lstm_epochs // 2),
-                            batch_size=cfg.lstm_batch,
-                            verbose=0
-                        )
-                        attn_lstm_forecast = recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), forecast_h, scaler_y)
-                    except Exception as e:
-                        logger.warning(f"Attention LSTM failed: {e}")
-                        attn_lstm_preds, attn_lstm_forecast = None, None
-
-                    finally:
-                        K.clear_session()
-                        gc.collect()
-                    
-
-            except Exception as e:
-                logger.warning(f"LSTM failed: {e}")
-                lstm_preds = None
-
-    # Collect predictions
+    # ------------------ XGBoost residual correction ------------------
     preds_by_model = {}
-    next_preds = {}
+    if lstm_preds is not None: preds_by_model["LSTM"] = lstm_preds
+    if tft_preds is not None: preds_by_model["TFT"] = tft_preds
+    if nbeats_preds is not None: preds_by_model["NBEATS"] = nbeats_preds
 
-    if progress_queue: progress_queue.put({"target": target_name, "status": "Validating Model Predictions..."})
+    xgb_val, xgb_forecast = None, None
+    if cfg.use_xgboost and len(preds_by_model) > 0:
+        try:
+            base_preds = np.mean(np.stack(list(preds_by_model.values())), axis=0)
+            residuals = y_all[n_train:n_train+val_h] - base_preds[:val_h]
+            xgb_model = xgb.XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05)
+            xgb_model.fit(X_scaled_full[:n_train], residuals[:n_train])
+            xgb_val = xgb_model.predict(X_scaled_full[n_train:n_train+val_h])
+            xgb_forecast = xgb_model.predict(X_scaled_full[-1:].repeat(forecast_h, axis=0))
+            preds_by_model["XGB_RESID"] = base_preds[:val_h] + xgb_val
+        except Exception as e:
+            logger.warning(f"XGBoost residuals failed: {e}")
 
-    preds_by_model["EMA"] = ema_val_preds[-val_h:]
-    preds_by_model["SARIMAX"] = sarima_preds
-    if prophet_preds is not None:
-        preds_by_model["Prophet"] = prophet_preds
-    if xgb_preds is not None:
-        preds_by_model["XGBoost"] = np.array(xgb_preds, dtype=float)
-    preds_by_model.update(preds_by_tree_model or {})
-    if lstm_preds is not None:
-        preds_by_model["LSTM"] = np.array(lstm_preds, dtype=float)
-    if cnn_lstm_preds is not None: 
-        preds_by_model["CNN-LSTM"] = np.array(cnn_lstm_preds, dtype=float)
-    if attn_lstm_preds is not None: 
-        preds_by_model["Attention-LSTM"] = np.array(attn_lstm_preds, dtype=float)
+    # ------------------ Ensemble predictions ------------------
+    ensemble_val = np.zeros(val_h, dtype=float)
+    ensemble_forecast = np.zeros(forecast_h, dtype=float)
+    for k in preds_by_model:
+        ensemble_val += preds_by_model[k]
+    ensemble_val /= len(preds_by_model)
+    preds_by_model["ENSEMBLE"] = ensemble_val
 
-    # Make sure all preds are length val_h
-    for k in list(preds_by_model.keys()):
-        arr = np.asarray(preds_by_model[k], dtype=float)
-        if arr.shape[0] < val_h:
-            if arr.size == 0:
-                arr = np.full(val_h, float(series.iloc[-1]))
-            else:
-                arr = np.concatenate([np.full(val_h - arr.shape[0], arr[-1]), arr])
-        elif arr.shape[0] > val_h:
-            arr = arr[-val_h:]
-        preds_by_model[k] = arr
-    
-    if progress_queue: progress_queue.put({"target": target_name, "status": "Forecasting Model Predictions..."})
-    
-    forecast_by_model = {}
-    forecast_by_model["EMA"] = ema_forecast
-    if sarima_forecast_preds is not None:
-        forecast_by_model["SARIMAX"] = np.asarray(sarima_forecast_preds, dtype=float)
-    if prophet_forecast_preds is not None:
-        forecast_by_model["Prophet"] = np.asarray(prophet_forecast_preds, dtype=float)
-    if xgb_forecast is not None:
-        forecast_by_model["XGBoost"] = np.asarray(xgb_forecast, dtype=float)
-    forecast_by_model.update(forecast_by_tree_model or {})
-    if lstm_forecast is not None:
-        forecast_by_model["LSTM"] = np.asarray(lstm_forecast, dtype=float)
-    if cnn_lstm_forecast is not None: 
-        forecast_by_model["CNN-LSTM"] = np.array(cnn_lstm_forecast, dtype=float)
-    if attn_lstm_forecast is not None: 
-        forecast_by_model["Attention-LSTM"] = np.array(attn_lstm_forecast, dtype=float)
+    for k in [l for l in [lstm_forecast, tft_forecast, nbeats_forecast, xgb_forecast] if l is not None]:
+        ensemble_forecast += k
+    ensemble_forecast /= max(1, sum(1 for l in [lstm_forecast, tft_forecast, nbeats_forecast, xgb_forecast] if l is not None))
+    forecast_by_model = {**{k: v for k,v in zip(preds_by_model.keys(), [lstm_forecast, tft_forecast, nbeats_forecast, xgb_forecast]) if v is not None}, "ENSEMBLE": ensemble_forecast}
 
-    # Normalize lengths to forecast_h
-    for k in list(forecast_by_model.keys()):
-        arr = np.asarray(forecast_by_model[k], dtype=float)
-        if arr.shape[0] < forecast_h:
-            if arr.size == 0:
-                arr = np.full(forecast_h, float(series.iloc[-1]))
-            else:
-                arr = np.concatenate([arr, np.full(forecast_h - arr.shape[0], arr[-1])])
-        elif arr.shape[0] > forecast_h:
-            arr = arr[:forecast_h]
-        forecast_by_model[k] = arr
-        
-    if progress_queue: progress_queue.put({"target": target_name, "status": "Calculating Weights & Metrics..."})
-    
-    y_val_actual = y_all[n_train:n_train+val_h].astype(float) 
-    weights = inverse_error_weights(y_val_actual, preds_by_model)
-    price_changes = np.abs(np.diff(y_val_actual))
-    avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
-    
-    # lstm_models = ["LSTM", "CNN-LSTM", "Attention-LSTM"] 
-    # lstm_forecasts = [forecast_by_model[m] for m in lstm_models if m in forecast_by_model]
-    
-    # if len(lstm_forecasts) >= 2:
-    #     slopes = [np.sign(f[-1] - f[0]) for f in lstm_forecasts]
-    #     if all(s == 1 for s in slopes):
-    #         for m in lstm_models:
-    #             if m in weights: weights[m] *= 1.5
-    #     elif all(s == -1 for s in slopes):
-    #         for m in lstm_models:
-    #             if m in weights: weights[m] *= 1.5
-    
-    ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
-    for k,w in weights.items():
-        if k in preds_by_model:
-            ensemble_val_preds += preds_by_model[k] * w
-    preds_by_model["ENSEMBLE"] = ensemble_val_preds
-    
-    ensemble_forecast = np.zeros(forecast_h, dtype=float) 
-    for k,w in weights.items(): 
-        if k in forecast_by_model: 
-            ensemble_forecast += forecast_by_model[k] * w 
-    forecast_by_model["ENSEMBLE"] = ensemble_forecast   
-    
+    # ------------------ Metrics ------------------
+    y_val_actual = y_all[n_train:n_train+val_h]
     metrics = {}
     for k, arr in preds_by_model.items():
-        mae = float(mean_absolute_error(y_val_actual, arr))
-        rmse = float(math.sqrt(mean_squared_error(y_val_actual, arr)))
-        mape = float(safe_mape(y_val_actual, arr))
-        vol_adj = mae / (avg_true_range + 1e-6)  # penalize models that ignore volatility
-        metrics[k] = {"MAE": mae, "RMSE": rmse, "MAPE%": mape, "VolAdjError": vol_adj}         
+        mae = mean_absolute_error(y_val_actual, arr)
+        rmse = math.sqrt(mean_squared_error(y_val_actual, arr))
+        mape = safe_mape(y_val_actual, arr)
+        metrics[k] = {"MAE": mae, "RMSE": rmse, "MAPE%": mape}
 
-  
-    # -------------------- Future timestamps --------------------
-    if progress_queue: progress_queue.put({"target": target_name, "status": "Formatting Next Predictions..."})
-    
+    # ------------------ Future timestamps ------------------
     last_time = series.index[-1]
     freq = pd.infer_freq(series.index) or '1D'
-    future_timestamps = pd.date_range(
-        start=last_time + timedelta_from_freq(freq),
-        periods=forecast_h, freq=freq).tolist()
-    next_preds = {model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)}
-                  for model, arr in forecast_by_model.items()}
-    
-     # --- NEW: run strategy detectors for this target, add to results ---
-    strategies = {}
-    try:
-        # df for the target: we operate on features_df aligned earlier
-        if progress_queue: progress_queue.put({"target": target_name, "status": "Detecting Strategies..."})
-        
-        target_df = features_df.copy()
-        # Breakout
-        strategies["breakout"] = detect_breakout(target_df, target_col=target_name)
-        # Mean reversion
-        strategies["mean_reversion"] = detect_mean_reversion(target_df, target_col=target_name)
-        # Fibonacci
-        strategies["fibonacci"] = detect_fibonacci_pullback(target_df, target_col=target_name)
-        # Price action
-        strategies["price_action"] = detect_price_action(target_df)
-        # Swing trade
-        strategies["swing"] = detect_swing_trade(target_df, target_col=target_name)
-        # Scalping helper (advisory)
-        strategies["scalping_helper"] = detect_scalping_opportunity(target_df, target_col=target_name)
-        # Market regime
-        strategies["regime"] = detect_market_regime(target_df)
-        # Options summary (light)
-        strategies["options_summary"] = fetch_options_flow_stub(cfg.ticker) if hasattr(cfg, "ticker") else {}
-        # News sentiment (stub)
-        strategies["news_sentiment"] = fetch_news_sentiment_stub(cfg.ticker) if hasattr(cfg, "ticker") else None
-    except Exception as e:
-        logger.debug(f"Strategy detection failed: {e}")
-        strategies = {}
-        
-    if strategies:
-        ensemble_forecast_arr = forecast_by_model.get("ENSEMBLE", [])
-        if len(ensemble_forecast_arr) > 1:
-            slope = ensemble_forecast_arr[-1] - ensemble_forecast_arr[0]
-            if all(
-            (v is None) or 
-            (str(v).lower() in ["none", "null"]) or 
-            pd.isna(v)
-            for v in strategies.values()
-        ):
-                if slope > 0:
-                    strategies["soft_bias"] = "bullish_bias"
-                elif slope < 0:
-                    strategies["soft_bias"] = "bearish_bias"
-                else:
-                    strategies["soft_bias"] = "neutral"
+    future_timestamps = pd.date_range(start=last_time + timedelta_from_freq(freq), periods=forecast_h, freq=freq)
+    next_preds = {model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)} for model, arr in forecast_by_model.items()}
 
-    # attempt to free memory
-    try:
-        if progress_queue: progress_queue.put({"target": target_name, "status": "Cleaning Memory..."})
-        if progress_queue: progress_queue.put({"target": target_name, "status": "Finished all models"})
-        del X_all, X_scaled_full
-        K.clear_session()
-        gc.collect()
-        progress_queue.put(None)
-    except Exception:
-        pass
+    return next_preds, metrics, {}, {}  # weights & strategies optional
 
-    # return saved_models, last_seq_dict, scaler_y
-    return  next_preds, metrics, weights, strategies
 
 def adjust_predictions(target, next_preds, model_sums, current_values):
     """
@@ -1753,7 +1612,7 @@ def predict_all_ohlcv(df: pd.DataFrame, cfg) -> dict:
     reader_thread.start()
     
     features = compute_indicators(df)
-    # df_with_indicators.reset_index().to_csv("stock_data.csv", index=False)
+    features_df = add_market_regimes(features, n_states=3)
 
 
     # Run forecasting in parallel
@@ -1762,7 +1621,7 @@ def predict_all_ohlcv(df: pd.DataFrame, cfg) -> dict:
             executor.submit(
                 forecast_univariate,
                 df[target],
-                features,
+                features_df,
                 cfg,
                 target_name=target,
                 progress_queue=progress_queue
@@ -2478,7 +2337,7 @@ if USE_TYPER:
         use_prophet: bool = typer.Option(False, help="Enable Prophet model if installed"),
         use_xgboost: bool = typer.Option(True, help="Enable XGBoost if installed"),
         use_lstm: bool = typer.Option(True, help="Enable LSTM (requires TensorFlow)"),
-        use_cnn_lstm: bool = typer.Option(False, help="Enable CNN-LSTM (requires TensorFlow)"),
+        use_cnn_lstm: bool = typer.Option(True, help="Enable CNN-LSTM (requires TensorFlow)"),
         use_attention_lstm: bool = typer.Option(True, help="Enable ATT-LSTM (requires TensorFlow)"),
         use_random_forest: bool = typer.Option(True, help="Enable RandomForest Regressor (requires TensorFlow)"),
         use_lightgbm: bool = typer.Option(True, help="Enable ATT-LSTM (requires TensorFlow)"),
