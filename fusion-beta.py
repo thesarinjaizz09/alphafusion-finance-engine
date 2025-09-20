@@ -1561,18 +1561,6 @@ def forecast_univariate(series: pd.Series,
     price_changes = np.abs(np.diff(y_val_actual))
     avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
     
-    # lstm_models = ["LSTM", "CNN-LSTM", "Attention-LSTM"] 
-    # lstm_forecasts = [forecast_by_model[m] for m in lstm_models if m in forecast_by_model]
-    
-    # if len(lstm_forecasts) >= 2:
-    #     slopes = [np.sign(f[-1] - f[0]) for f in lstm_forecasts]
-    #     if all(s == 1 for s in slopes):
-    #         for m in lstm_models:
-    #             if m in weights: weights[m] *= 1.5
-    #     elif all(s == -1 for s in slopes):
-    #         for m in lstm_models:
-    #             if m in weights: weights[m] *= 1.5
-    
     ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
     for k,w in weights.items():
         if k in preds_by_model:
