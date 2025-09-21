@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AlphaFusion v1.0.0 - Single-file Production-Grade AI Trading CLI Base Version
+AlphaFusion v1.0.0 - Single-file Production-Grade AI Trading CLI (Base Release)
 
 Features:
 - Unified forecasting system (LSTM, BiLSTM, PSO-LSTM, PSO-BiLSTM, TFT, SARIMAX, Prophet, XGBoost)
