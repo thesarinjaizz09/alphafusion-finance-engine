@@ -1,25 +1,42 @@
 #!/usr/bin/env python3
 """
-StockForecaster - single-file production CLI app (LSTM patch + epoch logging)
+AlphaFusion v1.0.0 - Single-file Production-Grade AI Trading CLI Base Version
 
-Patched v5: sanitizes datetime indices and timezone-aware datetimes to avoid
-- statsmodels FutureWarning about unsupported index
-- Prophet tz-aware -> tz-naive error
-
-Usage:
-  python stock_forecaster.py predict --ticker AAPL --timeframe 1d --lstm
+Features:
+- Unified forecasting system (LSTM, BiLSTM, PSO-LSTM, PSO-BiLSTM, TFT, SARIMAX, Prophet, XGBoost)
+- Patched datetime handling:
+    * DatetimeIndex -> tz-naive UTC (fixes statsmodels warnings)
+    * Prophet tz-aware -> tz-naive conversion
+- Strategy signals engine:
+    * Breakout, mean reversion, fibonacci, price action
+    * Swing trading, scalping, pairs trading
+    * Volume-based strategies (OBV, ADL, CMF, MFI, VPT, Force Index, EOM)
+    * Market regime detection (trend vs range, volatility)
+    * Momentum oscillators (RSI, StochRSI, MACD, TRIX, Ultimate Osc, TSI, Williams %R, ROC, CCI, Awesome Oscillator)
+    * Trend indicators (ADX, Ichimoku, SuperTrend, PSAR, HMA slope, KAMA slope)
+    * Neural signal fusion (ensemble of strategies with weighted scoring)
+- Confidence scoring:
+    * Bullish/Bearish scores with weighted strategy influence
+    * Confidence % and reason logging for each signal
+- Forecasting pipeline:
+    * Multi-model training (parallel execution via ThreadPoolExecutor)
+    * Automatic feature engineering (OHLCV + technicals)
+    * PSO/SCSO hyperparameter optimization hooks
+- Logging:
+    * Structured logging (console + file)
+    * Rich-powered live epoch logging for LSTM/BiLSTM
+    * JSON exports of per-candle analysis
+- CLI Usage:
+    python alpha_fusion.py predict --ticker AAPL --timeframe 1d --model lstm
+    python alpha_fusion.py strategies --ticker TSLA --timeframe 1h
+    python alpha_fusion.py forecast --ticker BTC-USD --timeframe 1d --ensemble
 
 Notes:
-- LSTM training prints epoch logs to the CLI via Rich.
-- TensorFlow, XGBoost, Prophet are optional; app runs without them.
-- This version preserves all original logic from codebasev1 but adds:
-    * structured logging (file + console)
-    * lazy imports for heavy libs
-    * parallel execution of independent model steps (ThreadPoolExecutor)
-    * strategy signals: breakout, mean reversion, fibonacci, price action,
-      swing trading, scalping helpers, pairs trading helpers, volume analysis,
-      market regime detection, news/options stubs.
+- Heavy dependencies (TensorFlow, Prophet, XGBoost) are lazily imported.
+- Designed as a **production-grade AI trading research system**.
+- Outputs are exportable (JSON, CSV) for downstream dashboards or trading bots.
 """
+
 from __future__ import annotations
 import os
 import sys
