@@ -127,6 +127,11 @@ with contextlib.redirect_stdout(open(os.devnull, 'w')), \
         from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Conv1D, BatchNormalization, Attention
     except Exception:
         tf = None
+        
+try:
+    from statsmodels.tsa.stattools import acf
+except Exception:
+    acf = None
 
 from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler
 from sklearn.linear_model import Ridge
@@ -159,6 +164,59 @@ def _ensure_series_has_datetime_index(s: pd.Series) -> pd.Series:
         # last-resort: coerce to range index converted to datetime by position
         s.index = pd.DatetimeIndex(pd.to_datetime(range(len(s))))
     return s
+
+def timedelta_from_freq(freq: str) -> pd.Timedelta:
+    """
+    Convert pandas frequency string to Timedelta-compatible arguments.
+    Example: '1D' -> pd.Timedelta(days=1), '5h' -> pd.Timedelta(hours=5)
+    """
+    import re
+    match = re.match(r"(\d+)([A-Za-z]+)", freq)
+    if not match:
+        raise ValueError(f"Invalid frequency string: {freq}")
+    val, unit = match.groups()
+    val = int(val)
+    unit_map = {
+        'D': 'days',
+        'd': 'days',
+        'H': 'hours',
+        'h': 'hours',
+        'T': 'minutes',  # T is pandas alias for min
+        'm': 'minutes',
+        'M': 'minutes',
+        'S': 'seconds',
+        's': 'seconds'
+    }
+    if unit not in unit_map:
+        raise ValueError(f"Unsupported freq unit: {unit}")
+    return pd.Timedelta(**{unit_map[unit]: val})
+
+def safe_mape(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    eps = 1e-8
+    denom = np.clip(np.abs(y_true), eps, None)
+    return float(np.mean(np.abs((y_true - y_pred) / denom))) * 100.0
+
+def inverse_error_weights(y_true: np.ndarray, preds_dict: Dict[str, np.ndarray]):
+    errs = {}
+    for k, v in preds_dict.items():
+        try:
+            errs[k] = safe_mape(y_true, v)
+        except Exception:
+            errs[k] = float("inf")
+    eps = 1e-8
+    weights = {}
+    denom = 0.0
+    for k, e in errs.items():
+        w = 0.0 if not np.isfinite(e) else 1.0 / (e + eps)
+        weights[k] = w
+        denom += w
+    if denom <= 0:
+        # all errors infinite / invalid -> fallback to equal weights
+        n = len(preds_dict)
+        return {k: 1.0 / n for k in preds_dict.keys()}
+    return {k: float(v / denom) for k, v in weights.items()}
 
 
 @dataclass
@@ -524,7 +582,6 @@ class StrategiesEngineer:
         
         return all_strategies
         
-
     def detect_all_strategies(self, df: pd.DataFrame, cfg: CLIConfig, target_name: str = 'Close'):
         
         target_df = df.copy()
@@ -550,7 +607,6 @@ class StrategiesEngineer:
         self.detect_extra_strategies(target_df)
         
     def detect_all_strategy(self, df: pd.DataFrame, cfg: CLIConfig, target_name: str = 'Close'):
-        
         target_df = df.copy()
         
         if console and not cfg.quiet:
@@ -952,36 +1008,36 @@ class TradingSignalEngineer:
         # Default weights if none provided
         self.WEIGHTS = weights or {
             "candle": 1,
-            "breakout": 3,
-            "mean_reversion": 2,
-            "fibonacci": 2,
-            "price_action": 2,
-            "swing": 2,
-            "scalping_helper": 1,
+            "breakout": 2,
+            "mean_reversion": 1,
+            "fibonacci": 1,
+            "price_action": 1,
+            "swing": 1,
+            "scalping_helper": 0.5,
             "regime": 1,
-            "options_summary": 2,
-            "ichimoku_bull": 1,
-            "psar_trend": 1,
-            "kama_slope": 1,
-            "trix_momentum": 1,
-            "obv_slope": 1,
-            "cmf": 1,
-            "mfi": 1,
-            "eom": 1,
-            "force_index": 1,
-            "adl_trend": 1,
-            "vpt_trend": 1,
-            "keltner_breakout": 1,
-            "donchian_breakout": 1,
-            "stoch_rsi": 1,
-            "ultimate_osc": 1,
-            "awesome_osc": 1,
-            "tsi": 1,
-            "cci": 1,
-            "williams_r": 1,
-            "roc": 1,
-            "adx": 1,
-            "adx_trend": 1,
+            "options": 1,
+            "ichimoku_bull": 0.5,
+            "psar_trend": 0.5,
+            "kama_slope": 0.5,
+            "trix_momentum": 0.5,
+            "obv_slope": 0.5,
+            "cmf": 0.5,
+            "mfi": 0.5,
+            "eom": 0.5,
+            "force_index": 0.5,
+            "adl_trend": 0.5,
+            "vpt_trend": 0.5,
+            "keltner_breakout": 2,
+            "donchian_breakout": 2,
+            "stoch_rsi": 0.5,
+            "ultimate_osc": 0.5,
+            "awesome_osc": 0.5,
+            "tsi": 0.5,
+            "cci": 0.5,
+            "williams_r": 0.5,
+            "roc": 0.5,
+            "adx": 0.5,
+            "adx_trend": 0.5,
             "supertrend_signal": 1,
             "hma_slope": 1
         }
@@ -1010,7 +1066,7 @@ class TradingSignalEngineer:
 
     def weighted_signal(self, name, value, bull_cond=None, bear_cond=None):
         """Helper for calculating weighted bull/bear scores and handling neutral/missing."""
-        b_score, br_score = 0, 0
+        b_score, br_score, r_score = 0, 0, 0
         weight = self.WEIGHTS.get(name, 1)
         if value is None or str(value).lower() in ["none", "neutral"]:
             return b_score, br_score, f"{name} missing/neutral → ignored", "neutral"
@@ -1026,7 +1082,7 @@ class TradingSignalEngineer:
 
     def generate_signal(self, json_data: Dict[str, Any], last_candle: pd.Series, cfg: CLIConfig, next_candle: pd.Series = None):
         """Generate trading signal with full reasoning using all strategies."""
-        bull_score, bear_score = 0, 0
+        bull_score, bear_score, r_score = 0, 0, 0
         reasons, strategies_influenced, neutral_or_missing = [], [], []
         
         if console and not cfg.quiet:
@@ -1077,13 +1133,147 @@ class TradingSignalEngineer:
                             strategies_influenced.append("candle")
 
                     # --- Apply all strategies ---
+                    breakout_signals = json_data.get('breakout', {}).get('signal')
+                    if any("bull" in str(sig).lower() for sig in breakout_signals):
+                        bull_score += self.WEIGHTS["breakout"]
+                        reasons.append("Breakout detected above the upper Bollinger band with volume — suggests strong upside momentum; trend-following entry favored.")
+                        strategies_influenced.append("Breakout Analytics")
+                    elif any("bear" in str(sig).lower() for sig in breakout_signals):
+                        bear_score += self.WEIGHTS["breakout"]
+                        reasons.append("Breakdown detected below the lower Bollinger band with volume — suggests strong downside momentum; trend-following short favored.")
+                        strategies_influenced.append("Breakout Analytics")
+                    else:
+                        reasons.append("No breakout or breakdown detected — suggests sideways momentum")
+                        neutral_or_missing.append("Breakout Analytics")
+
+                    # Mean Reversion
+                    mean_rev = json_data.get('mean_reversion', {}).get('signal')
+                    if any(str(sig) == "buy_revert" for sig in mean_rev):
+                        bull_score += self.WEIGHTS["mean_reversion"]
+                        reasons.append(
+                            "Mean-reversion signals (RSI oversold / lower band / negative z-score) — likely bounce to the mean; buy opportunity."
+                        )
+                        strategies_influenced.append("Mean Reversion")
+                    elif any(str(sig) == "sell_revert" for sig in mean_rev):
+                        bear_score += self.WEIGHTS["mean_reversion"]
+                        reasons.append(
+                            "Mean-reversion signals (RSI overbought / upper band / high z-score) — likely pullback to the mean; caution for longs."
+                        )
+                        strategies_influenced.append("Mean Reversion")
+                    else:
+                        reasons.append(
+                            "No mean-reversion signals  — likely sideways momentum"
+                        )
+                        neutral_or_missing.append("Mean Reversion")
+
+                    # Fibonacci
+                    fib = json_data.get('fibonacci', {})
+                    near = fib.get('near_level')
+                    dist = fib.get('distance', None)
+                    levels = fib.get('levels', {})
+                    if near in ["61.8%", "50%", "38.2%"] and dist is not None and dist < 2:
+                        bull_score += self.WEIGHTS["fibonacci"]
+                        lvl_val = levels.get(near)
+                        reasons.append(
+                            f"Price is within {dist:.2f} of {near} Fibonacci ({lvl_val:.2f}) — common support zone; watch for bounce."
+                        )
+                        strategies_influenced.append("Fibonacci Tracement")
+                    elif near == "0%" and dist is not None and dist < 2:
+                        bear_score += self.WEIGHTS["fibonacci"]
+                        lvl_val = levels.get("0%")
+                        reasons.append(
+                            f"Price is within {dist:.2f} of Fibonacci 0% (swing high {lvl_val:.2f}) — strong resistance; likely rejection."
+                        )
+                        strategies_influenced.append("Fibonacci Tracement")
+                    else:
+                        reasons.append(
+                            f"Price is within {dist:.2f} of Fibonacci 0% — likely sideways."
+                        )
+                        neutral_or_missing.append("Fibonacci Tracement")
+
+                    # Price Action
+                    bull_engulfing = json_data.get('price_action', {}).get('bullish_engulfing', 0)
+                    bear_engulfing = json_data.get('price_action', {}).get('bearish_engulfing', 0)
+                    if bull_engulfing > 1:
+                        bull_score += self.WEIGHTS["price_action"]
+                        reasons.append("Multiple bullish engulfing patterns detected — strong buyer conviction.")
+                        strategies_influenced.append("Price Action")
+                    elif bear_engulfing > 1:
+                        bear_score += self.WEIGHTS["price_action"]
+                        reasons.append("Multiple bearish engulfing patterns detected — strong seller conviction.")
+                        strategies_influenced.append("Price Action")
+                    if json_data.get('price_action', {}).get('pin_bar', 0):
+                        r_score += self.WEIGHTS['Price Action']
+                        reasons.append("Pin bar(s) detected — price rejection at a key level; watch for reversal.")
+                        neutral_or_missing.append("Price Action")
+
+                    # Scalping
+                    scalping = json_data.get('scalping_helper', {}).get('signal')
+                    if any("long" in str(sig).lower() for sig in scalping):
+                        bull_score += self.WEIGHTS["scalping"]
+                        reasons.append("Intraday: price above VWAP + rising volume — short-term buying momentum.")
+                        strategies_influenced.append("Scalping Helper")
+                    elif any("short" in str(sig).lower() for sig in scalping):
+                        bear_score += self.WEIGHTS["scalping"]
+                        reasons.append("Intraday: price below VWAP + rising volume — short-term selling momentum.")
+                        strategies_influenced.append("Scalping Helper")
+                    else:
+                        reasons.append("Intraday: no signal detected — sideways momentum.")
+                        neutral_or_missing.append("Scalping Helper")
+                    
+                    
+                        # Swing
+                    swing = json_data.get('swing', {})
+                    swing_sig = swing.get('signal', 'none')
+                    if swing_sig and swing_sig.lower() != "none":
+                        if "bullish" in swing_sig.lower():
+                            bull_score += self.WEIGHTS.get("price_action", 2)  # or give swing its own weight
+                            reasons.append("Swing strategy indicates long bias — market showing medium-term upward pressure.")
+                            strategies_influenced.append("Swing Analytics")
+                        elif "bearish" in swing_sig.lower():
+                            bear_score += self.WEIGHTS.get("price_action", 2)
+                            reasons.append("Swing strategy indicates short bias — market showing medium-term downward pressure.")
+                            strategies_influenced.append("Swing Analytics")
+                    else:
+                        reasons.append("Swing strategy indicates no bias — market showing sideways pressure.")
+                        neutral_or_missing.append("Swing Analytics")
+
+                    # Regime
+                    regime = json_data.get('regime', None)
+                    if regime:
+                        regime_lower = regime.lower()
+                        if regime_lower == "high":
+                            bull_score += self.WEIGHTS['regime']
+                            reasons.append("Market regime detected as HIGH volatility/uptrend — favorable for momentum strategies.")
+                            strategies_influenced.append("Regime Detection")
+                        elif regime_lower == "low":
+                            bear_score += self.WEIGHTS['regime']
+                            reasons.append("Market regime detected as LOW volatility/downtrend — risk of sideways or falling market.")
+                            strategies_influenced.append("Regime Detection")
+                        elif regime_lower == "medium":
+                            r_score += self.WEIGHTS['regime']
+                            reasons.append("Market regime detected as medium volatility/sidetrend — risk of sideways or market reversal.")
+                            neutral_or_missing.append("Regime Detection")
+                        
+
+                    # Options
+                    opts = json_data.get('options_summary', {})
+                    calls = opts.get('calls_oi_sum', 0)
+                    puts = opts.get('puts_oi_sum', 0) or 1
+                    oi_ratio = calls / max(puts, 1)
+                    if oi_ratio > 1.2:
+                        bull_score += self.WEIGHTS["options"]
+                        reasons.append(f"Options positioning bullish: Calls {calls} vs Puts {puts} (ratio {oi_ratio:.2f}) — sentiment supports bullish bias.")
+                        strategies_influenced.append("Options Positioning")
+                    elif oi_ratio < 0.8:
+                        bear_score += self.WEIGHTS["options"]
+                        reasons.append(
+                            f"Options positioning bearish: Calls {calls} vs Puts {puts} (ratio {oi_ratio:.2f}) — sentiment supports bearish bias."
+                        )
+                        strategies_influenced.append("Options Positioning")
+                    
                     # Strategy list for weighted signals
                     strategy_conditions = [
-                        ("breakout", lambda x: "bull" in x, lambda x: "bear" in x),
-                        ("mean_reversion", lambda x: "buy" in x, lambda x: "sell" in x),
-                        ("swing", lambda x: "bull" in x, lambda x: "bear" in x),
-                        ("scalping_helper", lambda x: "long" in x, lambda x: "short" in x),
-                        ("regime", lambda x: "high" in x, lambda x: "low" in x),
                         ("ichimoku_bull", lambda x: str(x).lower() in ["true","bullish"], lambda x: str(x).lower() in ["false","bearish"]),
                         ("psar_trend", lambda x: str(x).lower() in ["bullish"], lambda x: str(x).lower() in ["bearish"]),
                         ("adx_trend", lambda x: str(x).lower() in ["bullish"], lambda x: str(x).lower() in ["bearish"]),
@@ -1120,19 +1310,7 @@ class TradingSignalEngineer:
                                 if "bull" in val.lower(): bull_score += self.WEIGHTS.get(s,1)
                                 elif "bear" in val.lower(): bear_score += self.WEIGHTS.get(s,1)
                                 else: neutral_or_missing.append(s)
-
-                    # --- Final Signal ---
-                    if bull_score >= bear_score + 4: final_signal="STRONG_BUY"; trend="BULLISH"
-                    elif bull_score > bear_score: final_signal="BUY"; trend="BULLISH"
-                    elif bear_score >= bull_score + 4: final_signal="STRONG_SELL"; trend="BEARISH"
-                    elif bear_score > bull_score: final_signal="SELL"; trend="BEARISH"
-                    else: final_signal="HOLD"; trend="NEUTRAL"
-
-                    total_score = bull_score + bear_score + 1e-9
-                    conf_pct = abs(bull_score - bear_score)/total_score*100
-                    conf_label = "HIGH" if conf_pct>66 else "MEDIUM" if conf_pct>33 else "LOW"
-                    confidence_str = f"{conf_label} ({conf_pct:.1f}%)"
-
+                                
                     prog.update(t, description=f"Engineered trading signal.")
                 except Exception as e:
                     prog.stop()
@@ -1183,13 +1361,147 @@ class TradingSignalEngineer:
                     strategies_influenced.append("candle")
 
             # --- Apply all strategies ---
+            breakout_signals = json_data.get('breakout', {}).get('signal')
+            if any("bull" in str(sig).lower() for sig in breakout_signals):
+                bull_score += self.WEIGHTS["breakout"]
+                reasons.append("Breakout detected above the upper Bollinger band with volume — suggests strong upside momentum; trend-following entry favored.")
+                strategies_influenced.append("Breakout Analytics")
+            elif any("bear" in str(sig).lower() for sig in breakout_signals):
+                bear_score += self.WEIGHTS["breakout"]
+                reasons.append("Breakdown detected below the lower Bollinger band witvolume — suggests strong downside momentum; trend-following shorfavored.")
+                strategies_influenced.append("Breakout Analytics")
+            else:
+                reasons.append("No breakout or breakdown detected — suggests sideway momentum")
+                neutral_or_missing.append("Breakout Analytics")
+
+            # Mean Reversion
+            mean_rev = json_data.get('mean_reversion', {}).get('signal')
+            if any(str(sig) == "buy_revert" for sig in mean_rev):
+                bull_score += self.WEIGHTS["mean_reversion"]
+                reasons.append(
+                            "Mean-reversion signals (RSI oversold / lower band / negative z-score) — likely bounce to the mean; buy opportunity."
+                        )
+                strategies_influenced.append("Mean Reversion")
+            elif any(str(sig) == "sell_revert" for sig in mean_rev):
+                bear_score += self.WEIGHTS["mean_reversion"]
+                reasons.append(
+                            "Mean-reversion signals (RSI overbought / upper band / high z-score) — likely pullback to the mean; caution for longs."
+                        )
+                strategies_influenced.append("Mean Reversion")
+            else:
+                reasons.append(
+                            "No mean-reversion signals  — likely sideways momentum"
+                        )
+                neutral_or_missing.append("Mean Reversion")
+
+                    # Fibonacci
+            fib = json_data.get('fibonacci', {})
+            near = fib.get('near_level')
+            dist = fib.get('distance', None)
+            levels = fib.get('levels', {})
+            if near in ["61.8%", "50%", "38.2%"] and dist is not None and dist < 2:
+                bull_score += self.WEIGHTS["fibonacci"]
+                lvl_val = levels.get(near)
+                reasons.append(
+                    f"Price is within {dist:.2f} of {near} Fibonacci ({lvl_val:.2f}) — common support zone; watch for bounce."
+                )
+                strategies_influenced.append("Fibonacci Tracement")
+            elif near == "0%" and dist is not None and dist < 2:
+                bear_score += self.WEIGHTS["fibonacci"]
+                lvl_val = levels.get("0%")
+                reasons.append(
+                    f"Price is within {dist:.2f} of Fibonacci 0% (swing high {lvl_val:.2f}) — strong resistance; likely rejection."
+                )
+                strategies_influenced.append("Fibonacci Tracement")
+            else:
+                reasons.append(
+                    f"Price is within {dist:.2f} of Fibonacci 0% (swing {lvl_val:.2f}) — strong momentum; likely sideways."
+                )
+                neutral_or_missing.append("Fibonacci Tracement")
+
+                    # Price Action
+            bull_engulfing = json_data.get('price_action', {}).get('bullish_engulfing', 0)
+            bear_engulfing = json_data.get('price_action', {}).get('bearish_engulfing', 0)
+            if bull_engulfing > 1:
+                bull_score += self.WEIGHTS["price_action"]
+                reasons.append("Multiple bullish engulfing patterns detected — strong buyer conviction.")
+                strategies_influenced.append("Price Action")
+            elif bear_engulfing > 1:
+                bear_score += self.WEIGHTS["price_action"]
+                reasons.append("Multiple bearish engulfing patterns detected — strong seller conviction.")
+                strategies_influenced.append("Price Action")
+            if any(s.get('price_action', {}).get('pin_bar', 0) for s in json_data.values()):
+                r_score += self.WEIGHTS['Price Action']
+                reasons.append("Pin bar(s) detected — price rejection at a key level; watch for reversal.")
+                neutral_or_missing.append("Price Action")
+
+            # Scalping
+            scalping = json_data.get('scalping_helper', {}).get('signal')
+            if any("long" in str(sig).lower() for sig in scalping):
+                bull_score += self.WEIGHTS["scalping"]
+                reasons.append("Intraday: price above VWAP + rising volume — short-term buying momentum.")
+                strategies_influenced.append("Scalping Helper")
+            elif any("short" in str(sig).lower() for sig in scalping):
+                bear_score += self.WEIGHTS["scalping"]
+                reasons.append("Intraday: price below VWAP + rising volume — short-term selling momentum.")
+                strategies_influenced.append("Scalping Helper")
+            else:
+                reasons.append("Intraday: no signal detected — sideways momentum.")
+                neutral_or_missing.append("Scalping Helper")
+                    
+                    
+                # Swing
+            swing = json_data.get('swing', {})
+            swing_sig = swing.get('signal', 'none')
+            if swing_sig and swing_sig.lower() != "none":
+                if "bullish" in swing_sig.lower():
+                    bull_score += self.WEIGHTS.get("price_action", 2)  # or give swing its own weight
+                    reasons.append("Swing strategy indicates long bias — market showing medium-term upward pressure.")
+                    strategies_influenced.append("Swing Analytics")
+                elif "bearish" in swing_sig.lower():
+                    bear_score += self.WEIGHTS.get("price_action", 2)
+                    reasons.append("Swing strategy indicates short bias — market showing medium-term downward pressure.")
+                    strategies_influenced.append("Swing Analytics")
+            else:
+                reasons.append("Swing strategy indicates no bias — market showing sideways pressure.")
+                neutral_or_missing.append("Swing Analytics")
+
+            # Regime
+            regime = json_data.get('regime', None)
+            if regime:
+                regime_lower = regime.lower()
+                if regime_lower == "high":
+                    bull_score += self.WEIGHTS['regime']
+                    reasons.append("Market regime detected as HIGH volatility/uptrend — favorable for momentum strategies.")
+                    strategies_influenced.append("Regime Detection")
+                elif regime_lower == "low":
+                    bear_score += self.WEIGHTS['regime']
+                    reasons.append("Market regime detected as LOW volatility/downtrend — risk of sideways or falling market.")
+                    strategies_influenced.append("Regime Detection")
+                elif regime_lower == "medium":
+                    r_score += self.WEIGHTS['regime']
+                    reasons.append("Market regime detected as medium volatility/sidetrend — risk of sideways or market reversal.")
+                    neutral_or_missing.append("Regime Detection")
+                        
+
+            # Options
+            opts = json_data.get('options_summary', {})
+            calls = opts.get('calls_oi_sum', 0)
+            puts = opts.get('puts_oi_sum', 0) or 1
+            oi_ratio = calls / max(puts, 1)
+            if oi_ratio > 1.2:
+                bull_score += self.WEIGHTS["options"]
+                reasons.append(f"Options positioning bullish: Calls {calls} vs Puts {puts} (ratio {oi_ratio:.2f}) — sentiment supports bullish bias.")
+                strategies_influenced.append("Options Positioning")
+            elif oi_ratio < 0.8:
+                bear_score += self.WEIGHTS["options"]
+                reasons.append(
+                    f"Options positioning bearish: Calls {calls} vs Puts {puts} (ratio {oi_ratio:.2f}) — sentiment supports bearish bias."
+                )
+                strategies_influenced.append("Options Positioning")
+                    
             # Strategy list for weighted signals
             strategy_conditions = [
-                ("breakout", lambda x: "bull" in x, lambda x: "bear" in x),
-                ("mean_reversion", lambda x: "buy" in x, lambda x: "sell" in x),
-                ("swing", lambda x: "bull" in x, lambda x: "bear" in x),
-                ("scalping_helper", lambda x: "long" in x, lambda x: "short" in x),
-                ("regime", lambda x: "high" in x, lambda x: "low" in x),
                 ("ichimoku_bull", lambda x: str(x).lower() in ["true","bullish"], lambda x: str(x).lower() in ["false","bearish"]),
                 ("psar_trend", lambda x: str(x).lower() in ["bullish"], lambda x: str(x).lower() in ["bearish"]),
                 ("adx_trend", lambda x: str(x).lower() in ["bullish"], lambda x: str(x).lower() in ["bearish"]),
@@ -1417,7 +1729,559 @@ class OutputManager:
             if self.logger:
                 self.logger.warning(f"Plot saving failed for {ticker}: {e}")
 
+class ForecastUnivariate:
+    def __init__(self, series, features_df, cfg, target_name="Close", progress_queue=None):
+        # --- Align indexes ---
+        self.series = _ensure_series_has_datetime_index(series)
+        features_df.index = _ensure_datetime_index_tz_naive(features_df.index)
+        self.features_df, self.series = features_df.align(self.series, join="inner", axis=0)
+        self.features_df = self.features_df.dropna()
+        self.series = self.series.loc[self.features_df.index].dropna()
+        
 
+        # --- Config ---
+        self.cfg = cfg
+        self.target_name = target_name
+        self.progress_queue = progress_queue
+
+        self.val_h = cfg.val_horizon
+        self.forecast_h = cfg.forecast_horizon
+        self.n_total = len(self.series)
+        self.n_train = self.n_total - self.val_h
+        if len(self.series) < self.val_h + 20:
+            raise ValueError("Not enough data after indicators for training/validation")
+
+        # --- Data arrays ---
+        self.y_all = self.series.values.astype(float)
+        self.X_all = self.features_df.values.astype(float)
+
+        # --- Placeholders ---
+        self.pred_models = {}
+        self.forecast_models = {}
+        self.weights = {}
+        self.metrics = {}
+        self.strategies = {}
+
+    # ---------- Utilities ----------
+    def _notify(self, msg):
+        if self.progress_queue:
+            self.progress_queue.put({"target": self.target_name, "status": msg})
+
+    def _create_lag_features(self, y, n_lags=5):
+        X_lags = [pd.Series(y).shift(i) for i in range(n_lags, 0, -1)]
+        X_lags = pd.concat(X_lags, axis=1)
+        X_lags.columns = [f"lag_{i}" for i in range(n_lags, 0, -1)]
+        X_lags = X_lags[n_lags:]
+        y_trimmed = y[n_lags:]
+        return X_lags.values.astype(float), y_trimmed.astype(float)
+    
+    def _pick_n_lags(self, series, max_lags=30, threshold=0.2):
+        """
+        series: pd.Series of your target
+        max_lags: maximum number of lags to consider
+        threshold: minimum autocorrelation to consider significant
+        """
+        if not acf: return 5
+        
+        acf_vals = acf(series, nlags=max_lags, fft=False)
+        
+        # Find the last lag where autocorrelation is above the threshold
+        significant_lags = np.where(np.abs(acf_vals[1:]) > threshold)[0]  # exclude lag 0
+        if len(significant_lags) == 0:
+            return 1  # fallback to 1 lag if none significant
+        return significant_lags[-1] + 1  # add 1 because we skipped lag 0
+    
+    # ---------- Models ----------
+    def _build_random_forest(self, X_train, y_train, X_val=None, params: dict = None):
+        params = params or {}
+        model = RandomForestRegressor(
+            n_estimators=int(params.get("n_estimators", 300)),
+            max_depth=params.get("max_depth", None),
+            min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            n_jobs=-1,
+            random_state=42,
+        )
+        model.fit(X_train, y_train)
+        preds_val = model.predict(X_val) if X_val is not None else None
+        return preds_val, model
+    
+    def _build_xgboost(self,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: Optional[np.ndarray] = None,
+    X_future: Optional[np.ndarray] = None,
+    n_estimators: int = 300,
+    max_depth: int = 6,
+    learning_rate: float = 0.05,
+    n_jobs: int = -1,
+    random_state: int = 42):
+        """
+        Train XGBoost model and return validation + forecast predictions.
+        
+        Args:
+            X_train, y_train: Training data
+            X_val: Optional validation set for backtesting
+            X_future: Optional future features for forward forecast horizon
+        
+        Returns:
+            (val_preds, forecast_preds, model)
+        """
+        if xgb is None:
+            raise RuntimeError("xgboost not installed")
+
+        model = xgb.XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            objective="reg:squarederror",
+            n_jobs=n_jobs,
+            random_state=random_state,
+        )
+
+        model.fit(X_train, y_train)
+
+        val_preds, forecast_preds = None, None
+
+        if X_val is not None:
+            val_preds = model.predict(X_val)
+
+        if X_future is not None:
+            forecast_preds = model.predict(X_future)
+
+        return (
+            np.array(val_preds, dtype=float) if val_preds is not None else None,
+            np.array(forecast_preds, dtype=float) if forecast_preds is not None else None,
+            model,
+        )
+    
+    def _build_lstm(self, input_shape, units=64, dropout_rate=0.2, recurrent_dropout=0.1):
+        """
+        Build a multi-feature LSTM model for price prediction.
+
+        Args:
+            input_shape: tuple, (timesteps, features)
+            units: int, LSTM units for first layer
+            dropout_rate: float, dropout after LSTM layers
+            recurrent_dropout: float, recurrent dropout in LSTM layers
+
+        Returns:
+            Compiled Keras model
+        """
+        model = Sequential()
+        model.add(Input(shape=input_shape))
+
+        # First LSTM layer (returns sequences for stacking)
+        model.add(LSTM(units, activation="tanh", return_sequences=True, recurrent_dropout=recurrent_dropout))
+
+        # Second LSTM layer (captures longer dependencies)
+        model.add(LSTM(units//2, activation="tanh", recurrent_dropout=recurrent_dropout))
+
+        # Dropout for regularization
+        model.add(Dropout(dropout_rate))
+
+        # Output layer predicting next Close price
+        model.add(Dense(1, activation='linear'))
+
+        # Compile
+        model.compile(optimizer='adam', loss='mse')
+
+        return model
+    
+    # ---------- LSTM utilities ----------
+    def _train_lstm_model(self, X_seq_train, y_seq_train_scaled, lookback, n_features, X_seq_val=None, y_seq_val_scaled=None):
+        model = self._build_lstm((lookback, n_features), units=128)
+
+        class QueueLogger(Callback):
+            def __init__(self, total_epochs, target_name, progress_queue):
+                super().__init__()
+                self.total_epochs = total_epochs
+                self.target_name = target_name
+                self.progress_queue = progress_queue
+
+            def on_epoch_end(self, epoch, logs=None):
+                if self.progress_queue:
+                    loss = logs.get("loss", 0.0)
+                    val_loss = logs.get("val_loss", 0.0)
+                    self.progress_queue.put({
+                        "target": self.target_name,
+                        "status": f"LSTM epoch {epoch+1}/{self.total_epochs} "
+                                f"loss={loss:.4f} val_loss={val_loss:.4f}"
+                    })
+
+        callbacks = []
+        if 'EarlyStopping' in globals():
+            callbacks.append(EarlyStopping(monitor='loss', patience=5, restore_best_weights=True))
+        callbacks.append(QueueLogger(self.cfg.lstm_epochs, self.target_name, self.progress_queue))
+
+        model.fit(
+            X_seq_train, y_seq_train_scaled,
+            validation_data=(X_seq_val, y_seq_val_scaled) if X_seq_val is not None else None,
+            epochs=self.cfg.lstm_epochs,
+            batch_size=self.cfg.lstm_batch,
+            callbacks=callbacks,
+            verbose=0
+        )
+
+        return model
+
+    def _recursive_lstm_forecast(self, model, last_window, forecast_h, scaler_y):
+        preds = []
+        current_window = last_window.copy()
+
+        for _ in range(forecast_h):
+            next_scaled = model.predict(current_window, verbose=0).reshape(-1)[0]
+            next_val = scaler_y.inverse_transform([[next_scaled]])[0, 0]
+            preds.append(float(next_val))
+
+            # update window with new prediction (append to y-channel or features if univariate)
+            # if multivariate, we may need synthetic features; fallback is persistence
+            current_window = np.roll(current_window, -1, axis=1)
+            current_window[0, -1, 0] = next_scaled  # assumes target is first feature
+
+        return np.array(preds, dtype=float)
+    
+    def _recursive_rf_forecast(self, mdl, last_known_lags, last_features, forecast_h):
+        """
+        mdl: trained RandomForest
+        last_known_lags: np.array of last n_lags target values
+        last_features: np.array of last original features (same length as X_all columns)
+        forecast_h: int, how many steps to forecast
+        """
+        forecasts = []
+        lags = last_known_lags.copy()
+
+        for _ in range(forecast_h):
+            X_input = np.hstack([lags, last_features]).reshape(1, -1)
+            y_pred = mdl.predict(X_input)[0]
+            forecasts.append(y_pred)
+            # update lag vector
+            lags[:-1] = lags[1:]
+            lags[-1] = y_pred
+
+        return np.array(forecasts)
+    
+    def _recursive_xgb_forecast(self, mdl, last_known_lags, fixed_features, forecast_h):
+        forecasts = []
+        lags = last_known_lags.copy()
+        for _ in range(forecast_h):
+            X_input = np.hstack([lags, fixed_features]).reshape(1, -1)
+            y_pred = mdl.predict(X_input)[0]
+            forecasts.append(y_pred)
+            lags[:-1] = lags[1:]
+            lags[-1] = y_pred
+        return np.array(forecasts)
+    
+    # ---------- Run Models ----------
+    def _run_tree_models(self):
+        if self.cfg.use_random_forest and self.cfg.use_xgboost:
+            try:
+                self._notify("Running Tree Model Boosters...")
+                n_lags = self._pick_n_lags(self.y_all, max_lags=30, threshold=0.2)
+                X_lags, y_trimmed = self._create_lag_features(self.y_all, n_lags)
+                
+                X_all = self.X_all[n_lags:]
+                X_combined = np.hstack([X_lags, X_all])
+                
+                scaler_X = RobustScaler()
+                X_scaled = scaler_X.fit_transform(X_combined)
+                
+                n_train = self.n_train
+                rf_preds, rf_forecast, rf_model_obj = None, None, None
+                if self.cfg.use_random_forest:
+                    self._notify("Running RandomForest Regressor...")
+                    try:
+                        X_train, y_train = X_scaled[:n_train], y_trimmed[:n_train]
+                        X_val = X_scaled[n_train:]
+                        
+                        rf_params = {
+                            "n_estimators": 300,
+                            "max_depth": None,
+                            "min_samples_leaf": 1,
+                        }
+                        rf_preds, rf_model_obj = self._build_random_forest(
+                        X_train, y_train, X_val, params=rf_params
+                        )
+                        
+                        last_known_lags = y_trimmed[-n_lags:]
+                        last_features = X_all[-1, :]
+
+                        rf_forecast = self._recursive_rf_forecast(rf_model_obj, last_known_lags, last_features, self.forecast_h)
+
+                        if rf_preds is not None:
+                            self.pred_models["RF"] = rf_preds
+                        if rf_forecast is not None:
+                            self.forecast_models["RF"] = rf_forecast
+                    except Exception as e:
+                        logger.warning(f"RandomForest failed: {e}")
+                    
+                xgb_preds, xgb_forecast, xgb_model_obj = None, None, None
+                if self.cfg.use_xgboost and xgb is not None:
+                    self._notify("Running XGBoost Regressor...")
+                    try:
+                        # Validation phase
+                        X_tab_train = X_scaled[:n_train]
+                        y_tab_train = y_trimmed[:n_train]
+                        X_tab_val   = X_scaled[n_train:]
+
+                        xgb_preds, _, xgb_model_obj = self._build_xgboost(X_tab_train, y_tab_train, X_val=X_tab_val)
+
+                        # Recursive forecast
+                        last_known_lags_xgb = y_trimmed[-n_lags:]
+                        last_features_xgb = X_all[-1, :]
+                        xgb_forecast = self._recursive_xgb_forecast(xgb_model_obj, last_known_lags_xgb, last_features_xgb, self.forecast_h)
+                        
+                        if xgb_preds is not None:
+                            self.pred_models["XGB"] = xgb_preds
+                        if xgb_forecast is not None:
+                            self.forecast_models["XGB"] = xgb_forecast
+                    except Exception as e:
+                        logger.warning(f"XGBoost failed: {e}")
+            except Exception as e:
+                logger.warning(f"{self.target_name} Tree models failed: {e}")
+
+    def _run_lstms(self):
+        if self.cfg.use_lstm:
+            try:
+                self._notify("Running Vanilla LSTM...")
+                lstm_preds = lstm_forecast = None
+                
+                if tf is None:
+                    logger.warning("LSTM requested but TensorFlow not installed; skipping LSTM.")
+                else:
+                    # 1. Scale features
+                    X_all = self.features_df.values.astype(float)
+                    scaler_X = RobustScaler()
+                    scaler_X.fit(X_all[:self.n_train])
+                    X_scaled_full = scaler_X.transform(X_all)
+
+                    # 2. Scale target
+                    y_all_float = self.series.values.astype(float)
+                    y_train = y_all_float[:self.n_train].reshape(-1, 1)
+                    scaler_y = RobustScaler()
+                    scaler_y.fit(y_train)
+
+                    # 3. Build sequences
+                    lookback = min(60, max(10, self.cfg.candles // 3))
+                    n_seq = X_scaled_full.shape[0] - lookback
+                    if n_seq <= 0:
+                        raise RuntimeError("Not enough rows to build sequences for LSTM")
+
+                    X_seq = np.array([X_scaled_full[i:i+lookback] for i in range(n_seq)], dtype=float)
+                    y_seq = y_all_float[lookback:]  # aligned with X_seq
+
+                    # 4. Split sequences into train and validation
+                    last_train_seq_index = self.n_train - lookback
+                    if last_train_seq_index <= 0:
+                        raise RuntimeError("Not enough sequence training rows for LSTM after lookback")
+
+                    X_seq_train = X_seq[:last_train_seq_index]
+                    y_seq_train = y_seq[:last_train_seq_index]
+
+                    X_seq_val = X_seq[last_train_seq_index:last_train_seq_index + self.val_h]
+                    y_seq_val = y_seq[last_train_seq_index:last_train_seq_index + self.val_h]
+
+                    # pad validation if smaller than val_h
+                    if X_seq_val.shape[0] < self.val_h:
+                        pad_n = self.val_h - X_seq_val.shape[0]
+                        X_seq_val = np.vstack([np.repeat(X_seq_val[-1:], pad_n, axis=0), X_seq_val])
+                        y_seq_val = np.concatenate([np.repeat(y_seq_val[-1], pad_n), y_seq_val])
+
+                    # 5. Scale y sequences
+                    y_seq_train_scaled = scaler_y.transform(y_seq_train.reshape(-1, 1)).reshape(-1)
+                    y_seq_val_scaled = scaler_y.transform(y_seq_val.reshape(-1, 1)).reshape(-1)
+
+                    if self.cfg.use_lstm:
+                        try:
+                            model = self._train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, X_seq.shape[2], X_seq_val, y_seq_val_scaled)
+                            preds_scaled = model.predict(X_seq_val, verbose=0).reshape(-1)
+                            lstm_preds = scaler_y.inverse_transform(preds_scaled.reshape(-1,1)).reshape(-1)
+                            model.fit(
+                                X_seq,
+                                scaler_y.transform(y_seq.reshape(-1, 1)).reshape(-1),
+                                epochs=max(1, self.cfg.lstm_epochs // 2),
+                                batch_size=self.cfg.lstm_batch,
+                                verbose=0
+                            )
+                            lstm_forecast = self._recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), self.forecast_h, scaler_y)
+                            
+                            self.pred_models["LSTM"] = lstm_preds
+                            self.forecast_models["LSTM"] = lstm_forecast
+                        except Exception as e:
+                            logger.warning(f"Vanilla LSTM failed: {e}")
+                        finally:
+                            K.clear_session()
+                            gc.collect()
+            except Exception as e:
+                logger.warning(f"{self.target_name} LSTM failed: {e}")
+
+    # ---------- Metrics & Ensemble ----------
+    def _calculate_metrics(self):
+        self._notify("Calculating Weights & Metrics...")
+        for k in list(self.pred_models.keys()):
+            arr = np.asarray(self.pred_models[k], dtype=float)
+            if arr.shape[0] < self.val_h:
+                if arr.size == 0:
+                    arr = np.full(self.val_h, float(self.series.iloc[-1]))
+                else:
+                    arr = np.concatenate([np.full(self.val_h - arr.shape[0], arr[-1]), arr])
+            elif arr.shape[0] > self.val_h:
+                arr = arr[-self.val_h:]
+            self.pred_models[k] = arr
+            
+        for k in list(self.forecast_models.keys()):
+            arr = np.asarray(self.forecast_models[k], dtype=float)
+            if arr.shape[0] < self.forecast_h:
+                if arr.size == 0:
+                    arr = np.full(self.forecast_h, float(self.series.iloc[-1]))
+                else:
+                    arr = np.concatenate([arr, np.full(self.forecast_h - arr.shape[0], arr[-1])])
+            elif arr.shape[0] > self.forecast_h:
+                arr = arr[:self.forecast_h]
+            self.forecast_models[k] = arr
+        
+        y_val_actual = self.y_all[self.n_train : self.n_train + self.val_h].astype(float)
+        self.weights = inverse_error_weights(y_val_actual, self.pred_models)
+        
+
+        price_changes = np.abs(np.diff(y_val_actual))
+        avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
+
+        ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
+        for k, w in self.weights.items():
+            if k in self.pred_models:
+                ensemble_val_preds += self.pred_models[k] * w
+        self.pred_models["ENSEMBLE"] = ensemble_val_preds
+
+        ensemble_forecast = np.zeros(self.forecast_h, dtype=float)
+        for k, w in self.weights.items():
+            if k in self.forecast_models:
+                ensemble_forecast += self.forecast_models[k] * w
+        self.forecast_models["ENSEMBLE"] = ensemble_forecast
+
+        for k, arr in self.pred_models.items():
+            mae = float(mean_absolute_error(y_val_actual, arr))
+            rmse = float(math.sqrt(mean_squared_error(y_val_actual, arr)))
+            mape = float(safe_mape(y_val_actual, arr))
+            vol_adj = mae / (avg_true_range + 1e-6)
+            self.metrics[k] = {
+                "MAE": mae,
+                "RMSE": rmse,
+                "MAPE%": mape,
+                "VolAdjError": vol_adj,
+            }
+
+    # ---------- Main ----------
+    def run(self):
+        self._run_tree_models()
+        self._run_lstms()
+        self._calculate_metrics()
+
+        # Future timestamps
+        last_time = self.series.index[-1]
+        freq = pd.infer_freq(self.series.index) or "1D"
+        future_timestamps = pd.date_range(
+            start=last_time + timedelta_from_freq(freq),
+            periods=self.forecast_h,
+            freq=freq,
+        ).tolist()
+
+        next_preds = {
+            model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)}
+            for model, arr in self.forecast_models.items()
+        }
+
+        return next_preds, self.metrics, self.weights
+
+
+class OHLCVPredictor:
+    def __init__(self, df: pd.DataFrame, cfg):
+        console.print()
+        console.rule(f"[bold cyan]Forecast Progress", align='left')
+        
+        self.df = df
+        self.cfg = cfg
+        self.targets = ["Open", "High", "Low", "Close"]
+        self.manager = Manager()
+        self.progress_queue = self.manager.Queue()
+        self.results = {}
+        self.features = FeatureEngineer().add_all_indicators(self.df, self.cfg)
+
+        # Count total steps per target (roughly # of models per target)
+        self.total_steps = 20 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta
+
+        # Initialize tqdm bars
+        self.progress_bars = {
+            target: tqdm(
+                total=self.total_steps,
+                desc=target,
+                position=i,
+                leave=True,
+                ncols=int(os.get_terminal_size().columns * 0.6),
+                bar_format="{desc:<8} {percentage:3.0f}%|{bar}| {postfix} [{elapsed}]",
+            )
+            for i, target in enumerate(self.targets)
+        }
+
+    def _queue_reader(self):
+        completed_bars = {t: 0 for t in self.targets}
+        while True:
+            msg = self.progress_queue.get()
+            if msg is None:  # Sentinel to stop
+                break
+            target, status = msg.get("target"), msg.get("status")
+            if target in self.progress_bars:
+                bar = self.progress_bars[target]
+                bar.update(1)
+                completed_bars[target] += 1
+                bar.set_postfix_str(status)
+                bar.refresh()
+
+    def run_forecasts(self):
+        # Start queue reader thread
+        reader_thread = threading.Thread(target=self._queue_reader, daemon=True)
+        reader_thread.start()
+
+        # Run forecasting in parallel
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(
+                    ForecastUnivariate(
+                        self.df[target],
+                        self.features,
+                        self.cfg,
+                        target_name=target,
+                        progress_queue=self.progress_queue
+                    ).run
+                ): target
+                for target in self.targets
+            }
+
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    next_preds, metrics, weights = future.result()
+                    self.results[target] = {
+                        "next_preds": next_preds,
+                        "metrics": metrics,
+                        "weights": weights,
+                    }
+                except Exception as e:
+                    self.results[target] = {"error": str(e)}
+
+        # Stop the reader thread
+        self.progress_queue.put(None)
+        reader_thread.join()
+
+        # Close all bars
+        for bar in self.progress_bars.values():
+            bar.n = self.total_steps
+            bar.set_postfix_str("Done")
+            bar.close()
+            bar.clear()
+
+        console.rule(style="cyan")
+        return self.results
+    
 class StockForecasterCLI:
     def __init__(self):
         self.app = typer.Typer() if USE_TYPER else None
@@ -1484,23 +2348,21 @@ class StockForecasterCLI:
 
         # Optimized snippet
         last_candle = df.iloc[-1]
+        results = OHLCVPredictor(df, cfg).run_forecasts()
 
         # Compute features, strategies, and signals
-        features_df = self.feature_engieer.add_all_indicators(df, cfg)
-        strategies = self.strategies_engineer.detect_all_strategy(features_df, cfg, target_name='Close')
-        signals = self.trading_signal_engineer.generate_signal(strategies, last_candle, cfg)
+        
 
         # Pack results cleanly
-        results = {
+        response = {
             "candle": {
                 col: float(last_candle.get(col, 0))  # safe conversion to float
                 for col in ["Open", "High", "Low", "Close"]
             },
-            "strategies": strategies,
-            "signals": signals
+            "results": results
         }
 
-        self.output_engineer.save_outputs(df, results, cfg)
+        self.output_engineer.save_outputs(df, response, cfg)
         
 
         # Timing
