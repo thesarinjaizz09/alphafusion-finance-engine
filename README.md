@@ -31,10 +31,9 @@ Designed for **traders, analysts, and financial institutions**, it delivers **ro
 
 ![Forecast Output](images/forecast.png)  
 *Visual output showing ensemble forecasts for Open, High, Low, Close with top-model weights.*
+
 ![Forecast Output Plot](images/forecast_plot.png)  
 *Visual plotted output graph showing ensemble forecasts for Open, High, Low, Close with top-model weights.*
-![Forecast Output JSON](images/forecast_json.png)  
-*Visual output json showing ensemble forecasts for Open, High, Low, Close with top-model weights.*
 
 **Generated files per run:**
 - `outputs/json/<TICKER>_<TIMEFRAME>_<TIMESTAMP>.json` — full prediction, metrics, model weights  
