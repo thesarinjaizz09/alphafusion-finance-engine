@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-AlphaFusion v1.2.0 - Single-file Development-Grade AI Trading CLI (SCSO-LSTM + Crypto Support)
+AlphaFusion Finance v1.2.0 - Single-file Development-Grade AI Trading CLI (SCSO-LSTM + Crypto Support)
+Copyright (c) 2025 Alphafusion. All Rights Reserved.
+
+NOTICE:
+This software is the confidential and proprietary property of Alphafusion.
+Unauthorized copying, distribution, modification, or use of this software
+for commercial purposes is strictly prohibited and may result in civil
+and criminal penalties under the Copyright Act of India and international laws.
+
+By using this file, you acknowledge that you have read, understood, and
+agreed to these terms.
 
 Features:
 - Core Forecasting:

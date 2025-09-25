@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-AlphaFusion v1.0.0 - Single-file Production-Grade AI Trading CLI (Base Release)
+AlphaFusion Finance v1.0.0 - Single-file Production-Grade AI Trading CLI (Base Release)
+Copyright (c) 2025 Alphafusion. All Rights Reserved.
+
+NOTICE:
+This software is the confidential and proprietary property of Alphafusion.
+Unauthorized copying, distribution, modification, or use of this software
+for commercial purposes is strictly prohibited and may result in civil
+and criminal penalties under the Copyright Act of India and international laws.
+
+By using this file, you acknowledge that you have read, understood, and
+agreed to these terms.
 
 Features:
 - Unified forecasting system (LSTM, BiLSTM, PSO-LSTM, PSO-BiLSTM, TFT, SARIMAX, Prophet, XGBoost)
