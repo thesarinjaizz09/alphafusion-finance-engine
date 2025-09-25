@@ -1,0 +1,402 @@
+{
+  "generated_at_utc": "2025-09-25T22:26:14.364248+00:00",
+  "ticker": "NVDA",
+  "timeframe": "1d",
+  "cfg": {
+    "ticker": "NVDA",
+    "timeframe": "1d",
+    "candles": 180,
+    "val_horizon": 18,
+    "forecast_horizon": 5,
+    "use_lstm": true,
+    "use_random_forest": true,
+    "lstm_epochs": 100,
+    "lstm_batch": 32,
+    "output_dir": "outputs",
+    "quiet": false
+  },
+  "last_candle": {
+    "open": {
+      "TimeStamp": "2025-09-25 00:00:00",
+      "value": 174.47999572753906
+    },
+    "high": {
+      "TimeStamp": "2025-09-25 00:00:00",
+      "value": 180.25999450683594
+    },
+    "low": {
+      "TimeStamp": "2025-09-25 00:00:00",
+      "value": 173.125
+    },
+    "close": {
+      "TimeStamp": "2025-09-25 00:00:00",
+      "value": 177.69000244140625
+    },
+    "volume": {
+      "TimeStamp": "2025-09-25 00:00:00",
+      "value": 190579177
+    }
+  },
+  "results": {
+    "High": {
+      "next_preds": {
+        "RF": {
+          "2025-09-26 00:00:00": 178.9648298136393,
+          "2025-09-27 00:00:00": 178.9648298136393,
+          "2025-09-28 00:00:00": 178.9648298136393,
+          "2025-09-29 00:00:00": 178.9648298136393,
+          "2025-09-30 00:00:00": 178.9648298136393
+        },
+        "LSTM": {
+          "2025-09-26 00:00:00": 179.1480153526054,
+          "2025-09-27 00:00:00": 177.4628874611592,
+          "2025-09-28 00:00:00": 180.22051736334515,
+          "2025-09-29 00:00:00": 180.20325955604358,
+          "2025-09-30 00:00:00": 179.38053229400384
+        },
+        "ENSEMBLE": {
+          "2025-09-26 00:00:00": 179.0926223427973,
+          "2025-09-27 00:00:00": 177.91705599395775,
+          "2025-09-28 00:00:00": 179.84081319483192,
+          "2025-09-29 00:00:00": 179.82877393204274,
+          "2025-09-30 00:00:00": 179.2548290769156
+        }
+      },
+      "metrics": {
+        "RF": {
+          "MAE": 1.8208512313277667,
+          "RMSE": 2.394666271782866,
+          "MAPE%": 1.0488670171494712,
+          "VolAdjError": 0.7969734331044811
+        },
+        "LSTM": {
+          "MAE": 4.200731913248698,
+          "RMSE": 5.143409213719068,
+          "MAPE%": 2.4039403984869825,
+          "VolAdjError": 1.8386300192202405
+        },
+        "ENSEMBLE": {
+          "MAE": 3.361522520848905,
+          "RMSE": 4.25467824534405,
+          "MAPE%": 1.9273249578889387,
+          "VolAdjError": 1.4713141292413108
+        }
+      },
+      "weights": {
+        "RF": 0.302387459843974,
+        "LSTM": 0.697612540156026
+      }
+    },
+    "Low": {
+      "next_preds": {
+        "RF": {
+          "2025-09-26 00:00:00": 173.90416666666667,
+          "2025-09-27 00:00:00": 173.90416666666667,
+          "2025-09-28 00:00:00": 173.90416666666667,
+          "2025-09-29 00:00:00": 173.90416666666667,
+          "2025-09-30 00:00:00": 173.90416666666667
+        },
+        "LSTM": {
+          "2025-09-26 00:00:00": 174.66296669491385,
+          "2025-09-27 00:00:00": 172.55052143167586,
+          "2025-09-28 00:00:00": 174.7185605705049,
+          "2025-09-29 00:00:00": 175.2912345097293,
+          "2025-09-30 00:00:00": 174.59017449896146
+        },
+        "ENSEMBLE": {
+          "2025-09-26 00:00:00": 174.43532668643968,
+          "2025-09-27 00:00:00": 172.9566150021731,
+          "2025-09-28 00:00:00": 174.47424239935344,
+          "2025-09-29 00:00:00": 174.8751141568105,
+          "2025-09-30 00:00:00": 174.38437214927302
+        }
+      },
+      "metrics": {
+        "RF": {
+          "MAE": 0.6395057678222698,
+          "RMSE": 0.7928555345435776,
+          "MAPE%": 0.3730633939284774,
+          "VolAdjError": 0.26480583539174324
+        },
+        "LSTM": {
+          "MAE": 5.171726650661892,
+          "RMSE": 5.670909426384505,
+          "MAPE%": 3.019895067834412,
+          "VolAdjError": 2.141502805846271
+        },
+        "ENSEMBLE": {
+          "MAE": 3.6773291219075586,
+          "RMSE": 4.067196740588625,
+          "MAPE%": 2.1475853581039996,
+          "VolAdjError": 1.522704343157304
+        }
+      },
+      "weights": {
+        "RF": 0.3,
+        "LSTM": 0.7
+      }
+    },
+    "Close": {
+      "next_preds": {
+        "RF": {
+          "2025-09-26 00:00:00": 178.2737661743164,
+          "2025-09-27 00:00:00": 178.2737661743164,
+          "2025-09-28 00:00:00": 178.2737661743164,
+          "2025-09-29 00:00:00": 178.2737661743164,
+          "2025-09-30 00:00:00": 178.2737661743164
+        },
+        "LSTM": {
+          "2025-09-26 00:00:00": 177.10842818451601,
+          "2025-09-27 00:00:00": 174.63394300524124,
+          "2025-09-28 00:00:00": 175.94999489599104,
+          "2025-09-29 00:00:00": 175.97143932160952,
+          "2025-09-30 00:00:00": 175.34828954187242
+        },
+        "ENSEMBLE": {
+          "2025-09-26 00:00:00": 177.45802958145612,
+          "2025-09-27 00:00:00": 175.7258899559638,
+          "2025-09-28 00:00:00": 176.64712627948865,
+          "2025-09-29 00:00:00": 176.66213737742157,
+          "2025-09-30 00:00:00": 176.22593253160562
+        }
+      },
+      "metrics": {
+        "RF": {
+          "MAE": 1.1884597919605382,
+          "RMSE": 1.5397111886117845,
+          "MAPE%": 0.6827093946115493,
+          "VolAdjError": 0.4472833562874745
+        },
+        "LSTM": {
+          "MAE": 4.454941643608941,
+          "RMSE": 5.955767488636711,
+          "MAPE%": 2.592547472354358,
+          "VolAdjError": 1.6766417037391945
+        },
+        "ENSEMBLE": {
+          "MAE": 3.4014879972669783,
+          "RMSE": 4.531935814339477,
+          "MAPE%": 1.9781272470870144,
+          "VolAdjError": 1.2801686502824925
+        }
+      },
+      "weights": {
+        "RF": 0.3,
+        "LSTM": 0.7
+      }
+    },
+    "Open": {
+      "next_preds": {
+        "RF": {
+          "2025-09-26 00:00:00": 175.23973510742186,
+          "2025-09-27 00:00:00": 175.23973510742186,
+          "2025-09-28 00:00:00": 175.23973510742186,
+          "2025-09-29 00:00:00": 175.23973510742186,
+          "2025-09-30 00:00:00": 175.23973510742186
+        },
+        "LSTM": {
+          "2025-09-26 00:00:00": 175.00247897586905,
+          "2025-09-27 00:00:00": 172.22782076282147,
+          "2025-09-28 00:00:00": 175.42976184318422,
+          "2025-09-29 00:00:00": 175.75828541615056,
+          "2025-09-30 00:00:00": 175.44279884180514
+        },
+        "ENSEMBLE": {
+          "2025-09-26 00:00:00": 175.0736558153349,
+          "2025-09-27 00:00:00": 173.13139506620158,
+          "2025-09-28 00:00:00": 175.3727538224555,
+          "2025-09-29 00:00:00": 175.60272032353194,
+          "2025-09-30 00:00:00": 175.38187972149015
+        }
+      },
+      "metrics": {
+        "RF": {
+          "MAE": 1.1494903931794356,
+          "RMSE": 1.498969737449132,
+          "MAPE%": 0.6698246462083575,
+          "VolAdjError": 0.4425120990266257
+        },
+        "LSTM": {
+          "MAE": 3.971954345703125,
+          "RMSE": 4.933783124238585,
+          "MAPE%": 2.3122873193624525,
+          "VolAdjError": 1.529058324614158
+        },
+        "ENSEMBLE": {
+          "MAE": 3.003747540791829,
+          "RMSE": 3.8242113250277883,
+          "MAPE%": 1.7505821034012956,
+          "VolAdjError": 1.1563338302857566
+        }
+      },
+      "weights": {
+        "RF": 0.3,
+        "LSTM": 0.7
+      }
+    }
+  },
+  "strategies": {
+    "breakout": {
+      "signal": "none",
+      "reason": "no breakout",
+      "vol_spike": false
+    },
+    "mean_reversion": {
+      "signal": "none",
+      "reasons": []
+    },
+    "fibonacci": {
+      "levels": {
+        "0%": 183.61000061035156,
+        "23.6%": 162.5351998901367,
+        "38.2%": 149.49739944458008,
+        "50%": 138.95999908447266,
+        "61.8%": 128.42259872436523,
+        "100%": 94.30999755859375
+      },
+      "near_level": "0%",
+      "distance": 5.9199981689453125
+    },
+    "price_action": {
+      "bullish_engulfing": 0.0,
+      "bearish_engulfing": 0.0,
+      "pin_bar": 0.0
+    },
+    "swing": {
+      "signal": "none",
+      "reasons": []
+    },
+    "scalping_helper": {
+      "signal": "none",
+      "reason": null
+    },
+    "regime": "high",
+    "options_summary": {
+      "expiries": [
+        "2025-09-26",
+        "2025-10-03",
+        "2025-10-10",
+        "2025-10-17",
+        "2025-10-24",
+        "2025-10-31",
+        "2025-11-21",
+        "2025-12-19",
+        "2026-01-16",
+        "2026-02-20",
+        "2026-03-20",
+        "2026-04-17",
+        "2026-05-15",
+        "2026-06-18",
+        "2026-08-21",
+        "2026-09-18",
+        "2026-12-18",
+        "2027-01-15",
+        "2027-06-17",
+        "2027-12-17",
+        "2028-01-21"
+      ],
+      "calls_oi_sum": 846145,
+      "puts_oi_sum": 616982
+    },
+    "news_sentiment": null,
+    "ichimoku_bull": 1.0,
+    "psar_trend": "bullish",
+    "kama_slope": 1.0,
+    "trix_momentum": 1.0,
+    "obv_slope": 1.0,
+    "cmf": 0.08005697289898749,
+    "mfi": 54.800839902884455,
+    "eom": -3.3601000583619296,
+    "force_index": 82309356.07666937,
+    "adl_trend": 1.0,
+    "vpt_trend": 1.0,
+    "keltner_breakout": "neutral",
+    "donchian_breakout": "neutral",
+    "stoch_rsi": 0.5960551454858547,
+    "ultimate_osc": 58.61296567752627,
+    "awesome_osc": 1.3211312237907862,
+    "tsi": 4.738515150038001,
+    "cci": 42.35429943780775,
+    "williams_r": -38.517695399915695,
+    "roc": 4.058332254334248,
+    "adx": 18.74720881928867,
+    "adx_trend": "bearish",
+    "supertrend_signal": "bullish",
+    "hma_slope": 1.0
+  },
+  "trading_signal": {
+    "signal": "STRONG_BUY",
+    "trend": "BULLISH",
+    "bull_score": 12.5,
+    "bear_score": 1.5,
+    "confidence": "HIGH (78.6%)",
+    "confidence_score": 78.57142856581632,
+    "reasons": [
+      "No breakout or breakdown detected \u2014 suggests sideways momentum",
+      "No mean-reversion signals  \u2014 likely sideways momentum",
+      "Price is within 5.92 of Fibonacci 0% \u2014 likely sideways.",
+      "Intraday: no signal detected \u2014 sideways momentum.",
+      "Swing strategy indicates no bias \u2014 market showing sideways pressure.",
+      "Market regime detected as HIGH volatility/uptrend \u2014 favorable for momentum strategies.",
+      "Options positioning bullish: Calls 846145 vs Puts 616982 (ratio 1.37) \u2014 sentiment supports bullish bias.",
+      "ichimoku_bull bullish signal detected.",
+      "psar_trend bullish signal detected.",
+      "adx_trend bearish signal detected.",
+      "supertrend_signal bullish signal detected.",
+      "adl_trend bullish signal detected.",
+      "vpt_trend bullish signal detected.",
+      "kama_slope positive \u2192 bullish",
+      "trix_momentum positive \u2192 bullish",
+      "obv_slope positive \u2192 bullish",
+      "cmf positive \u2192 bullish",
+      "mfi positive \u2192 bullish",
+      "eom negative \u2192 bearish",
+      "force_index positive \u2192 bullish",
+      "stoch_rsi positive \u2192 bullish",
+      "ultimate_osc positive \u2192 bullish",
+      "awesome_osc positive \u2192 bullish",
+      "tsi positive \u2192 bullish",
+      "cci positive \u2192 bullish",
+      "williams_r negative \u2192 bearish",
+      "roc positive \u2192 bullish",
+      "adx positive \u2192 bullish",
+      "hma_slope positive \u2192 bullish"
+    ],
+    "neutral_or_missing": [
+      "Breakout Analytics",
+      "Mean Reversion",
+      "Fibonacci Tracement",
+      "Scalping Helper",
+      "Swing Analytics",
+      "keltner_breakout",
+      "donchian_breakout"
+    ],
+    "strategies_influenced": [
+      "Regime Detection",
+      "Options Positioning",
+      "ichimoku_bull",
+      "psar_trend",
+      "adx_trend",
+      "supertrend_signal",
+      "adl_trend",
+      "vpt_trend",
+      "kama_slope",
+      "trix_momentum",
+      "obv_slope",
+      "cmf",
+      "mfi",
+      "eom",
+      "force_index",
+      "stoch_rsi",
+      "ultimate_osc",
+      "awesome_osc",
+      "tsi",
+      "cci",
+      "williams_r",
+      "roc",
+      "adx",
+      "hma_slope"
+    ]
+  },
+  "disclaimer": "Forecasts \u2260 financial advice. Any losses are your responsibility\u2014trade responsibly."
+}

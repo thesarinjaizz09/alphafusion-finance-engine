@@ -46,8 +46,11 @@ Notes:
 - ML forecasting and ensemble predictions to be added in future updates
 """
 
-
+#--------------------
+# REQUIRED PACKAGES & LIBRARIES
+#--------------------
 from __future__ import annotations
+import re
 import ta
 import os
 import gc
@@ -57,45 +60,47 @@ import math
 import time
 import ccxt
 import logging
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Dict, Any, Tuple, List, Optional
+import warnings
+import threading
 import contextlib
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager, Queue
-from tqdm import tqdm
-import threading
 import talib as tlb
-
-import warnings
-
-# Quiet noisy warnings from statsmodels during SARIMAX parameter search;
-# keep other warnings visible. Adjust if you want to see them.
+import pandas as pd
+from tqdm import tqdm
+import mplfinance as mpf
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+from multiprocessing import Manager, Queue
+from typing import Dict, Any, Tuple, List, Optional
+from mplfinance.original_flavor import candlestick_ohlc
+from concurrent.futures import ProcessPoolExecutor, as_completed
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# Rich UI
+#--------------------
+# RICH UI
+#--------------------
 try:
-    from rich import print as rprint
-    from rich.live import Live
-    from rich.console import Console, RenderableType
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.progress import Progress, SpinnerColumn, Task, TextColumn, ProgressColumn
-    from rich.spinner import Spinner
     from rich.text import Text
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.spinner import Spinner
+    from rich.console import Console, RenderableType
     from rich.traceback import install as rich_install
+    from rich.progress import Progress, SpinnerColumn, Task, TextColumn, ProgressColumn
     rich_install()
     console = Console()
 except Exception:
     console = None
     def rprint(*args, **kwargs): print(*args, **kwargs)
 
-# CLI: Typer fallback to argparse
+
+#--------------------
+# CLI TYPER FALLBACK TO ARGPARSER
+#--------------------
 USE_TYPER = True
 try:
     import typer
@@ -104,19 +109,19 @@ except Exception:
     USE_TYPER = False
     import argparse
 
-# External optional libs
+
+#--------------------
+# YFINANCE LIBRARY
+#--------------------
 try:
     import yfinance as yf
 except Exception:
     raise RuntimeError("yfinance is required. Install: pip install yfinance")
 
-# XGBoost (optional)
-try:
-    import xgboost as xgb
-except Exception:
-    xgb = None
 
-# TensorFlow/Keras (optional)
+#--------------------
+# TENSORFLOW
+#--------------------
 with contextlib.redirect_stdout(open(os.devnull, 'w')), \
      contextlib.redirect_stderr(open(os.devnull, 'w')):
     try:
@@ -124,27 +129,40 @@ with contextlib.redirect_stdout(open(os.devnull, 'w')), \
         import tensorflow as tf
         tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
         from tensorflow.keras import backend as K
-        from tensorflow.keras.models import Sequential, Model
+        from tensorflow.keras.models import Sequential
         from tensorflow.keras.callbacks import EarlyStopping, Callback
-        from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Conv1D, BatchNormalization, Attention
+        from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
     except Exception:
         tf = None
-        
+
+
+#--------------------
+# STATSMODEL
+#--------------------
 try:
     from statsmodels.tsa.stattools import acf
 except Exception:
     acf = None
+    
 
-from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import TimeSeriesSplit
+#--------------------
+# SCIKIT-LEARN
+#--------------------
+from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
-logger = logging.getLogger("StockForecaster")
 
+#--------------------
+# LOGGING CONFIGS
+#--------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
+logger = logging.getLogger("AlphaFusion-Finance")
+
+
+#--------------------
+# UTILITIES
+#--------------------
 def _ensure_datetime_index_tz_naive(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     """Return a tz-naive DatetimeIndex. If idx is tz-aware, convert to UTC then drop tz.
     If idx is already naive, return as DatetimeIndex.
@@ -167,31 +185,25 @@ def _ensure_series_has_datetime_index(s: pd.Series) -> pd.Series:
         s.index = pd.DatetimeIndex(pd.to_datetime(range(len(s))))
     return s
 
-def timedelta_from_freq(freq: str) -> pd.Timedelta:
-    """
-    Convert pandas frequency string to Timedelta-compatible arguments.
-    Example: '1D' -> pd.Timedelta(days=1), '5h' -> pd.Timedelta(hours=5)
-    """
+def normalize_freq(freq: str) -> str:
+    """Map yfinance/pandas shorthand to safe pandas offsets."""
+    mapping = {
+        "m": "min",    # lowercase m = minutes
+        "h": "H",      # hours
+        "d": "D",      # days
+        "wk": "W",     # weeks
+        "mo": "MS",    # month start (use 'M' for month end)
+    }
+    
     import re
     match = re.match(r"(\d+)([A-Za-z]+)", freq)
     if not match:
-        raise ValueError(f"Invalid frequency string: {freq}")
+        return freq
     val, unit = match.groups()
-    val = int(val)
-    unit_map = {
-        'D': 'days',
-        'd': 'days',
-        'H': 'hours',
-        'h': 'hours',
-        'T': 'minutes',  # T is pandas alias for min
-        'm': 'minutes',
-        'M': 'minutes',
-        'S': 'seconds',
-        's': 'seconds'
-    }
-    if unit not in unit_map:
-        raise ValueError(f"Unsupported freq unit: {unit}")
-    return pd.Timedelta(**{unit_map[unit]: val})
+    unit = unit.lower()
+    if unit in mapping:
+        return f"{val}{mapping[unit]}"
+    return freq
 
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray):
     y_true = np.asarray(y_true, dtype=float)
@@ -200,28 +212,10 @@ def safe_mape(y_true: np.ndarray, y_pred: np.ndarray):
     denom = np.clip(np.abs(y_true), eps, None)
     return float(np.mean(np.abs((y_true - y_pred) / denom))) * 100.0
 
-def inverse_error_weights(y_true: np.ndarray, preds_dict: Dict[str, np.ndarray]):
-    errs = {}
-    for k, v in preds_dict.items():
-        try:
-            errs[k] = safe_mape(y_true, v)
-        except Exception:
-            errs[k] = float("inf")
-    eps = 1e-8
-    weights = {}
-    denom = 0.0
-    for k, e in errs.items():
-        w = 0.0 if not np.isfinite(e) else 1.0 / (e + eps)
-        weights[k] = w
-        denom += w
-    if denom <= 0:
-        # all errors infinite / invalid -> fallback to equal weights
-        n = len(preds_dict)
-        return {k: 1.0 / n for k in preds_dict.keys()}
-    return {k: float(v / denom) for k, v in weights.items()}
+def safe_filename(s: str) -> str:
+    # replace invalid chars (:, /, \, etc.) with "-"
+    return re.sub(r'[<>:"/\\|?*]', '-', s)
 
-
-#-----UTILITES------
 class SpinnerOrTickColumn(ProgressColumn):
     """Show spinner while running, tick when finished."""
 
@@ -234,17 +228,12 @@ class SpinnerOrTickColumn(ProgressColumn):
 class CLIConfig:
     ticker: str
     timeframe: str = "1d"
-    candles: int = 360
-    val_horizon: int = 36
-    forecast_horizon: int = 4
-    use_prophet: bool = True
-    use_xgboost: bool = True
+    candles: int = 180
+    val_horizon: int = 18
+    forecast_horizon: int = 5
     use_lstm: bool = True
-    use_cnn_lstm: bool = True
-    use_attention_lstm: bool = True
     use_random_forest: bool = True
-    use_lightgbm: bool = True
-    lstm_epochs: int = 20
+    lstm_epochs: int = 100
     lstm_batch: int = 32
     output_dir: str = "outputs"
     quiet: bool = False
@@ -258,6 +247,10 @@ PERIOD_FOR_INTERVAL = {
     "1d": ("5y", "1d"),
 }
 
+
+#--------------------
+# CORE CLASSED
+#--------------------
 class FinancialDataFetcher:
     """Class to fetch stock and cryptocurrency data"""
     
@@ -676,7 +669,7 @@ class StrategiesEngineer:
         vwap = ta.volume.VolumeWeightedAveragePrice(
             high=df["High"], low=df["Low"], close=df["Close"], volume=df["Volume"], window=14
         )
-        return vwap.vwap()
+        return vwap.vwap
 
     def _zscore(self, series: pd.Series, window: int = 20):
         m = series.rolling(window=window, min_periods=1).mean()
@@ -1577,39 +1570,56 @@ class TradingSignalEngineer:
 class OutputManager:
     def __init__(self):
         self.logger = logger
+        self.strategies_engineer = StrategiesEngineer()
+        self.trading_signal_engineer = TradingSignalEngineer()
 
     @staticmethod
     def ensure_dirs(base="outputs"):
         os.makedirs(base, exist_ok=True)
-        # os.makedirs(os.path.join(base, "plots"), exist_ok=True)
+        os.makedirs(os.path.join(base, "plots"), exist_ok=True)
         os.makedirs(os.path.join(base, "json"), exist_ok=True)
-
-    def pretty_print_results(self, ticker: str, timeframe: str, results: dict):
+        
+        
+    def _pretty_print_results(self, results: dict):
         if console:
+            # collect all timestamps from the ensemble forecasts (dict keys)
+            all_times = []
+            for t in ["Open", "High", "Low", "Close"]:
+                ens = results.get(t, {}).get("next_preds", {}).get("ENSEMBLE", None)
+                if isinstance(ens, dict):
+                    times = list(ens.keys())
+                    if len(times) > len(all_times):  # use the longest set of times
+                        all_times = times
+
+            # create table with dynamic columns
             table = Table(title="Next-step predictions (ensemble)", show_edge=False)
             table.add_column("Target")
-            table.add_column("Prediction", justify="right")
+            for ts in all_times:
+                table.add_column(ts, justify="right")
             table.add_column("Top model weight", justify="right")
 
+            # add rows
             for t in ["Open", "High", "Low", "Close"]:
                 if "error" in results.get(t, {}):
-                    table.add_row(t, "[red]Error[/red]", results[t]["error"])
+                    row = [t] + ["Error"] * len(all_times) + [results[t]["error"]]
+                    table.add_row(*row)
                     continue
 
-                next_preds = results[t].get("adjusted_preds", {})
-                ens = next_preds.get("ENSEMBLE", None)
+                next_preds = results[t].get("next_preds", {})
+                ens = next_preds.get("ENSEMBLE", {})
 
-                # Format ensemble predictions safely
+                # values aligned with timestamps
                 if isinstance(ens, dict):
-                    ens_str = ", ".join(f"{v:.4f}" for v in list(ens.values())[:5])
+                    values = [f"{ens.get(ts, float('nan')):.4f}" for ts in all_times]
                 elif isinstance(ens, (list, np.ndarray)):
-                    ens_str = ", ".join(f"{v:.4f}" for v in ens[:5])
-                elif isinstance(ens, (float, int, np.floating)):
-                    ens_str = f"{float(ens):.4f}"
+                    values = [f"{v:.4f}" for v in ens]
+                    # pad if shorter
+                    if len(values) < len(all_times):
+                        values += ["N/A"] * (len(all_times) - len(values))
                 else:
-                    ens_str = "N/A"
+                    values = ["N/A"] * len(all_times)
 
-                # Safely compute top model
+                # compute top model
                 weights = results[t].get("weights", {})
                 numeric_weights = {
                     k: float(v)
@@ -1617,20 +1627,17 @@ class OutputManager:
                     if isinstance(v, (int, float, np.floating))
                 }
                 if numeric_weights:
-                    top_model, top_weight = max(
-                        numeric_weights.items(), key=lambda x: x[1]
-                    )
+                    top_model, top_weight = max(numeric_weights.items(), key=lambda x: x[1])
                     top_str = f"{top_model} ({top_weight:.2f})"
                 else:
                     top_str = "N/A"
 
-                table.add_row(t, ens_str, top_str)
+                table.add_row(t, *values, top_str)
 
             panel = Panel(
                 table, title="📊 Forecast Summary", border_style="cyan", padding=(1, 2)
             )
             console.print(panel)
-
         else:
             print(json.dumps(results, indent=2, default=str))
 
@@ -1639,6 +1646,20 @@ class OutputManager:
     ):
         self.ensure_dirs(cfg.output_dir)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        
+        last_candle = df.iloc[-1]
+        timestamp = last_candle.name
+
+        # Convert to dict with timestamp for each field
+        last_candle_dict = {
+            "open": {"TimeStamp": str(timestamp), "value": float(last_candle["Open"])},
+            "high": {"TimeStamp": str(timestamp), "value": float(last_candle["High"])},
+            "low": {"TimeStamp": str(timestamp), "value": float(last_candle["Low"])},
+            "close": {"TimeStamp": str(timestamp), "value": float(last_candle["Close"])},
+            "volume": {"TimeStamp": str(timestamp), "value": int(last_candle["Volume"])}
+        }
+        strategies = self.strategies_engineer.detect_all_strategy(df, cfg)
+        trading_signal = self.trading_signal_engineer.generate_signal(strategies, last_candle, cfg)
 
         # Prepare JSON data
         in_json = {
@@ -1646,7 +1667,11 @@ class OutputManager:
             "ticker": cfg.ticker,
             "timeframe": cfg.timeframe,
             "cfg": asdict(cfg),
+            "last_candle": last_candle_dict,
             "results": results,
+            "strategies": strategies,
+            "trading_signal": trading_signal,
+            "disclaimer": "Forecasts ≠ financial advice. Any losses are your responsibility—trade responsibly."
         }
 
         # Save JSON safely
@@ -1658,83 +1683,76 @@ class OutputManager:
             json.dump(in_json, f, indent=2, default=float)
 
         # Save plot
-        # self._save_plot(ticker, timeframe, df, results, ts)
+        self._pretty_print_results(results)
+        plot_path = self._save_plot(cfg.ticker, cfg.timeframe, df, ts, cfg, results)
 
-        return json_path
+        return json_path, plot_path
 
-    def _save_plot(self, ticker: str, timeframe: str, df: pd.DataFrame, results, ts):
+    def _save_plot(self, ticker: str, timeframe: str, df: pd.DataFrame, ts, cfg, results):
         try:
-            fig, ax = plt.subplots(1, 1, figsize=(12, 6))
-            ax.plot(df.index, df["Close"], label="Close (historical)", color="black", linewidth=1.5)
-            ax.scatter(df.index[-1], df["Close"].iloc[-1], color="black", s=50, label="Last Close")
+            # Take last 100 candles
+            hist_df = df.tail(100).copy()
+            hist_df = hist_df.reset_index()
+            hist_df.rename(columns={hist_df.columns[0]: "Date"}, inplace=True)
 
-            close_res = results.get("Close", {})
-            next_preds = close_res.get("adjusted_preds", {})
+            # Extract ensemble predictions for O/H/L/C
+            pred_dicts = {
+                "Open": results.get("Open", {}).get("next_preds", {}).get("ENSEMBLE", {}),
+                "High": results.get("High", {}).get("next_preds", {}).get("ENSEMBLE", {}),
+                "Low": results.get("Low", {}).get("next_preds", {}).get("ENSEMBLE", {}),
+                "Close": results.get("Close", {}).get("next_preds", {}).get("ENSEMBLE", {}),
+            }
 
-            model_colors = ["red", "blue", "green", "orange", "purple", "brown", "cyan"]
+            # Build prediction DataFrame
+            pred_times = list(pred_dicts["Close"].keys())
+            pred_times = pd.to_datetime(pred_times)
 
-            for i, (model_name, pred_val) in enumerate(next_preds.items()):
-                if isinstance(pred_val, (int, float)) and len(df.index) > 1:
-                    delta = df.index[-1] - df.index[-2]
-                    next_time = df.index[-1] + delta
-                    ax.scatter(
-                        [next_time],
-                        [pred_val],
-                        color=model_colors[i % len(model_colors)],
-                        s=60,
-                        label=f"{model_name} Prediction: {pred_val:.4f}",
-                        marker="X",
-                    )
+            pred_df = pd.DataFrame({
+                "Date": pred_times,
+                "Open": list(pred_dicts["Open"].values()),
+                "High": list(pred_dicts["High"].values()),
+                "Low": list(pred_dicts["Low"].values()),
+                "Close": list(pred_dicts["Close"].values()),
+            })
+            
+            hist_df["DateNum"] = mdates.date2num(hist_df["Date"])
+            pred_df["DateNum"] = mdates.date2num(pred_df["Date"])
 
-            ens = next_preds.get("ENSEMBLE")
-            if isinstance(ens, (int, float)) and len(df.index) > 1:
-                delta = df.index[-1] - df.index[-2]
-                next_time = df.index[-1] + delta
-                ax.scatter(
-                    [next_time],
-                    [ens],
-                    color="magenta",
-                    s=80,
-                    label=f"Ensemble next: {ens:.4f}",
-                    marker="D",
-                )
+            hist_ohlc = hist_df[["DateNum", "Open", "High", "Low", "Close"]].values
+            pred_ohlc = pred_df[["DateNum", "Open", "High", "Low", "Close"]].values
+            
+            # Prepare figure
+            fig, ax = plt.subplots(figsize=(12,6))
+            candlestick_ohlc(
+                ax,
+                hist_ohlc,
+                width=0.0006 if timeframe.endswith("m") else 0.4,  # adapt width
+                colorup="green", colordown="red", alpha=0.8
+            )
+            candlestick_ohlc(
+                ax,
+                pred_ohlc,
+                width=0.0006 if timeframe.endswith("m") else 0.4,  # adapt width
+                colorup="blue", colordown="orange", alpha=0.8
+            )
 
-            # Strategy annotation
-            strat = close_res.get("strategies", {})
-            breakout_signal = strat.get("breakout", {}).get("signal")
-            if breakout_signal == "bullish":
-                ax.annotate(
-                    "Breakout (Bullish)",
-                    xy=(df.index[-1], df["Close"].iloc[-1]),
-                    xytext=(0, 25),
-                    textcoords="offset points",
-                    arrowprops=dict(arrowstyle="->", color="green", lw=2),
-                    fontsize=10,
-                    fontweight="bold",
-                )
-            elif breakout_signal == "bearish":
-                ax.annotate(
-                    "Breakout (Bearish)",
-                    xy=(df.index[-1], df["Close"].iloc[-1]),
-                    xytext=(0, 25),
-                    textcoords="offset points",
-                    arrowprops=dict(arrowstyle="->", color="red", lw=2),
-                    fontsize=10,
-                    fontweight="bold",
-                )
-
-            ax.set_title(f"{ticker.upper()} {timeframe} — Close & Forecast", fontsize=14, fontweight="bold")
+            # Formatting
+            ax.xaxis_date()
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+            ax.set_title(f"{ticker.upper()} {timeframe} — Last 100 + Ensemble Forecast", fontsize=14, fontweight="bold")
             ax.set_xlabel("Date")
             ax.set_ylabel("Price ($)")
             ax.grid(alpha=0.3)
-            ax.legend(loc="best", fontsize=9)
+            ax.set_xlim(hist_ohlc[0,0] - 0.001, pred_ohlc[-1,0] + 0.005)
+
             fig.autofmt_xdate()
             fig.tight_layout()
 
-            plot_path = os.path.join(self.cfg.output_dir, "plots", f"{ticker}_{timeframe}_{ts}.png")
+            plot_path = os.path.join(cfg.output_dir, "plots", f"{ticker}_{timeframe}_{ts}.png")
             os.makedirs(os.path.dirname(plot_path), exist_ok=True)
             fig.savefig(plot_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
+            return plot_path
 
         except Exception as e:
             if self.logger:
@@ -1815,55 +1833,6 @@ class ForecastUnivariate:
         model.fit(X_train, y_train)
         preds_val = model.predict(X_val) if X_val is not None else None
         return preds_val, model
-    
-    def _build_xgboost(self,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: Optional[np.ndarray] = None,
-    X_future: Optional[np.ndarray] = None,
-    n_estimators: int = 300,
-    max_depth: int = 6,
-    learning_rate: float = 0.05,
-    n_jobs: int = -1,
-    random_state: int = 42):
-        """
-        Train XGBoost model and return validation + forecast predictions.
-        
-        Args:
-            X_train, y_train: Training data
-            X_val: Optional validation set for backtesting
-            X_future: Optional future features for forward forecast horizon
-        
-        Returns:
-            (val_preds, forecast_preds, model)
-        """
-        if xgb is None:
-            raise RuntimeError("xgboost not installed")
-
-        model = xgb.XGBRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            learning_rate=learning_rate,
-            objective="reg:squarederror",
-            n_jobs=n_jobs,
-            random_state=random_state,
-        )
-
-        model.fit(X_train, y_train)
-
-        val_preds, forecast_preds = None, None
-
-        if X_val is not None:
-            val_preds = model.predict(X_val)
-
-        if X_future is not None:
-            forecast_preds = model.predict(X_future)
-
-        return (
-            np.array(val_preds, dtype=float) if val_preds is not None else None,
-            np.array(forecast_preds, dtype=float) if forecast_preds is not None else None,
-            model,
-        )
     
     def _build_lstm(self, input_shape, units=64, dropout_rate=0.2, recurrent_dropout=0.1):
         """
@@ -1971,82 +1940,50 @@ class ForecastUnivariate:
 
         return np.array(forecasts)
     
-    def _recursive_xgb_forecast(self, mdl, last_known_lags, fixed_features, forecast_h):
-        forecasts = []
-        lags = last_known_lags.copy()
-        for _ in range(forecast_h):
-            X_input = np.hstack([lags, fixed_features]).reshape(1, -1)
-            y_pred = mdl.predict(X_input)[0]
-            forecasts.append(y_pred)
-            lags[:-1] = lags[1:]
-            lags[-1] = y_pred
-        return np.array(forecasts)
-    
     # ---------- Run Models ----------
     def _run_tree_models(self):
-        if self.cfg.use_random_forest and self.cfg.use_xgboost:
+        if self.cfg.use_random_forest:
             try:
                 self._notify("Running Tree Model Boosters...")
-                n_lags = self._pick_n_lags(self.y_all, max_lags=30, threshold=0.2)
-                X_lags, y_trimmed = self._create_lag_features(self.y_all, n_lags)
-                
-                X_all = self.X_all[n_lags:]
-                X_combined = np.hstack([X_lags, X_all])
-                
-                scaler_X = RobustScaler()
-                X_scaled = scaler_X.fit_transform(X_combined)
-                
                 n_train = self.n_train
+                X_all = self.features_df.values.astype(float)
+                y_all = self.series.values.astype(float)
+
+
+                # Fit scaler on training rows only
+                scaler_X = RobustScaler()
+                scaler_X.fit(X_all[:n_train])
+                X_scaled_full = scaler_X.transform(X_all)
+                
+                # ----------------- Tree Models: RF, LGBM -----------------
+                X_tab_train = X_scaled_full[:n_train]
+                y_tab_train = y_all[:n_train]
+                X_tab_val   = X_scaled_full[n_train:n_train + self.val_h]
+                
                 rf_preds, rf_forecast, rf_model_obj = None, None, None
                 if self.cfg.use_random_forest:
                     self._notify("Running RandomForest Regressor...")
                     try:
-                        X_train, y_train = X_scaled[:n_train], y_trimmed[:n_train]
-                        X_val = X_scaled[n_train:]
-                        
                         rf_params = {
                             "n_estimators": 300,
                             "max_depth": None,
                             "min_samples_leaf": 1,
                         }
                         rf_preds, rf_model_obj = self._build_random_forest(
-                        X_train, y_train, X_val, params=rf_params
+                        X_tab_train, y_tab_train, X_tab_val, params=rf_params
                         )
                         
-                        last_known_lags = y_trimmed[-n_lags:]
-                        last_features = X_all[-1, :]
-
-                        rf_forecast = self._recursive_rf_forecast(rf_model_obj, last_known_lags, last_features, self.forecast_h)
+                        last_feat = np.repeat(X_scaled_full[-1:], self.forecast_h, axis=0)
+                        rf_forecast = rf_model_obj.predict(last_feat)
+                        rf_preds = rf_model_obj.predict(X_scaled_full[-self.val_h:])
 
                         if rf_preds is not None:
-                            self.pred_models["RF"] = rf_preds
+                            self.pred_models["RF"] = np.array(rf_preds, dtype=float)
                         if rf_forecast is not None:
-                            self.forecast_models["RF"] = rf_forecast
+                            self.forecast_models["RF"] = np.array(rf_forecast, dtype=float)
                     except Exception as e:
                         logger.warning(f"RandomForest failed: {e}")
-                    
-                xgb_preds, xgb_forecast, xgb_model_obj = None, None, None
-                if self.cfg.use_xgboost and xgb is not None:
                     self._notify("Running XGBoost Regressor...")
-                    try:
-                        # Validation phase
-                        X_tab_train = X_scaled[:n_train]
-                        y_tab_train = y_trimmed[:n_train]
-                        X_tab_val   = X_scaled[n_train:]
-
-                        xgb_preds, _, xgb_model_obj = self._build_xgboost(X_tab_train, y_tab_train, X_val=X_tab_val)
-
-                        # Recursive forecast
-                        last_known_lags_xgb = y_trimmed[-n_lags:]
-                        last_features_xgb = X_all[-1, :]
-                        xgb_forecast = self._recursive_xgb_forecast(xgb_model_obj, last_known_lags_xgb, last_features_xgb, self.forecast_h)
-                        
-                        if xgb_preds is not None:
-                            self.pred_models["XGB"] = xgb_preds
-                        if xgb_forecast is not None:
-                            self.forecast_models["XGB"] = xgb_forecast
-                    except Exception as e:
-                        logger.warning(f"XGBoost failed: {e}")
             except Exception as e:
                 logger.warning(f"{self.target_name} Tree models failed: {e}")
 
@@ -2115,8 +2052,8 @@ class ForecastUnivariate:
                             )
                             lstm_forecast = self._recursive_lstm_forecast(model, X_seq[-1].reshape(1,lookback,X_seq.shape[2]), self.forecast_h, scaler_y)
                             
-                            self.pred_models["LSTM"] = lstm_preds
-                            self.forecast_models["LSTM"] = lstm_forecast
+                            self.pred_models["LSTM"] = np.array(lstm_preds, dtype=float)
+                            self.forecast_models["LSTM"] = np.array(lstm_forecast, dtype=float)
                         except Exception as e:
                             logger.warning(f"Vanilla LSTM failed: {e}")
                         finally:
@@ -2125,9 +2062,10 @@ class ForecastUnivariate:
             except Exception as e:
                 logger.warning(f"{self.target_name} LSTM failed: {e}")
 
-    # ---------- Metrics & Ensemble ----------
     def _calculate_metrics(self):
         self._notify("Calculating Weights & Metrics...")
+
+        # --- Align predictions with validation / forecast horizons ---
         for k in list(self.pred_models.keys()):
             arr = np.asarray(self.pred_models[k], dtype=float)
             if arr.shape[0] < self.val_h:
@@ -2138,7 +2076,7 @@ class ForecastUnivariate:
             elif arr.shape[0] > self.val_h:
                 arr = arr[-self.val_h:]
             self.pred_models[k] = arr
-            
+
         for k in list(self.forecast_models.keys()):
             arr = np.asarray(self.forecast_models[k], dtype=float)
             if arr.shape[0] < self.forecast_h:
@@ -2149,25 +2087,61 @@ class ForecastUnivariate:
             elif arr.shape[0] > self.forecast_h:
                 arr = arr[:self.forecast_h]
             self.forecast_models[k] = arr
-        
-        y_val_actual = self.y_all[self.n_train : self.n_train + self.val_h].astype(float)
-        self.weights = inverse_error_weights(y_val_actual, self.pred_models)
-        
 
+        # --- Actual validation values ---
+        y_val_actual = self.y_all[self.n_train : self.n_train + self.val_h].astype(float)
+
+        # --- Calculate errors for all models ---
+        model_errors = {}
+        for k, arr in self.pred_models.items():
+            mae = float(mean_absolute_error(y_val_actual, arr))
+            model_errors[k] = mae
+
+        # --- Separate baseline vs trend models ---
+        baseline_models = ["RF"]  # treat RF as baseline
+        trend_models = [k for k in self.pred_models.keys() if k not in baseline_models]
+
+        # --- Dynamic baseline weight based on error ---
+        baseline_mae = np.mean([model_errors[k] for k in baseline_models])
+        trend_mae = np.mean([model_errors[k] for k in trend_models])
+        
+        # baseline weight proportional to inverse error ratio
+        baseline_weight = baseline_mae / (baseline_mae + trend_mae)  
+        # ensure baseline weight is not too small or too large
+        baseline_weight = np.clip(baseline_weight, 0.3, 0.6)
+
+        # --- Trend model weights (inverse-error, normalized to remaining weight) ---
+        trend_weights = {}
+        inv_errors = np.array([1.0 / (model_errors[k] + 1e-6) for k in trend_models])
+        if inv_errors.sum() > 0:
+            inv_errors /= inv_errors.sum()  # normalize
+            for i, k in enumerate(trend_models):
+                trend_weights[k] = inv_errors[i] * (1 - baseline_weight)
+        else:
+            for k in trend_models:
+                trend_weights[k] = (1 - baseline_weight) / len(trend_models)
+
+        # --- Ensemble predictions for validation ---
+        ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
+        for k in baseline_models:
+            ensemble_val_preds += self.pred_models[k] * baseline_weight
+        for k, w in trend_weights.items():
+            ensemble_val_preds += self.pred_models[k] * w
+        self.pred_models["ENSEMBLE"] = ensemble_val_preds
+
+        # --- Ensemble forecasts ---
+        ensemble_forecast = np.zeros(self.forecast_h, dtype=float)
+        for k in baseline_models:
+            ensemble_forecast += self.forecast_models[k] * baseline_weight
+        for k, w in trend_weights.items():
+            ensemble_forecast += self.forecast_models[k] * w
+        self.forecast_models["ENSEMBLE"] = ensemble_forecast
+
+        # --- Metrics ---
         price_changes = np.abs(np.diff(y_val_actual))
         avg_true_range = price_changes.mean() if len(price_changes) > 0 else 1.0
 
-        ensemble_val_preds = np.zeros_like(y_val_actual, dtype=float)
-        for k, w in self.weights.items():
-            if k in self.pred_models:
-                ensemble_val_preds += self.pred_models[k] * w
-        self.pred_models["ENSEMBLE"] = ensemble_val_preds
-
-        ensemble_forecast = np.zeros(self.forecast_h, dtype=float)
-        for k, w in self.weights.items():
-            if k in self.forecast_models:
-                ensemble_forecast += self.forecast_models[k] * w
-        self.forecast_models["ENSEMBLE"] = ensemble_forecast
+        self.weights = {**{k: baseline_weight for k in baseline_models}, **trend_weights}
 
         for k, arr in self.pred_models.items():
             mae = float(mean_absolute_error(y_val_actual, arr))
@@ -2181,6 +2155,7 @@ class ForecastUnivariate:
                 "VolAdjError": vol_adj,
             }
 
+
     # ---------- Main ----------
     def run(self):
         self._run_tree_models()
@@ -2189,15 +2164,21 @@ class ForecastUnivariate:
 
         # Future timestamps
         last_time = self.series.index[-1]
-        freq = pd.infer_freq(self.series.index) or "1D"
-        future_timestamps = pd.date_range(
-            start=last_time + timedelta_from_freq(freq),
-            periods=self.forecast_h,
-            freq=freq,
-        ).tolist()
+        freq = normalize_freq(self.cfg.timeframe)  # e.g. '1h', '5min', '1d'
 
+        # Generate future timestamps correctly aligned with the timeframe
+        future_timestamps = pd.date_range(
+            start=last_time,
+            periods=self.forecast_h + 1,   # include the last_time + forecast_h steps
+            freq=freq
+        ).tolist()[1:]  # skip the first one because it's just last_time
+
+        # Map forecasts to timestamps
         next_preds = {
-            model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)}
+            model: {
+                str(ts): float(pred)
+                for ts, pred in zip(future_timestamps, arr)
+            }
             for model, arr in self.forecast_models.items()
         }
 
@@ -2217,7 +2198,7 @@ class OHLCVPredictor:
 
 
         # Count total steps per target (roughly # of models per target)
-        self.total_steps = 20 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta
+        self.total_steps = 3 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta
 
         # Initialize tqdm bars
         self.progress_bars = {
@@ -2297,9 +2278,7 @@ class StockForecasterCLI:
         self.app = typer.Typer() if USE_TYPER else None
         self.data_fetcher = FinancialDataFetcher()
         self.feature_engieer = FeatureEngineer()
-        self.strategies_engineer = StrategiesEngineer()
         self.PERIOD_FOR_INTERVAL = PERIOD_FOR_INTERVAL
-        self.trading_signal_engineer = TradingSignalEngineer()
         self.output_engineer = OutputManager()
 
     def run_predict(self,
@@ -2308,13 +2287,8 @@ class StockForecasterCLI:
                     candles: int = 360,
                     val_horizon: int = 36,
                     forecast_horizon: int = 4,
-                    use_prophet: bool = True,
-                    use_xgboost: bool = True,
                     use_lstm: bool = True,
-                    use_cnn_lstm: bool = True,
-                    use_attention_lstm: bool = True,
                     use_random_forest: bool = True,
-                    use_lightgbm: bool = True,
                     lstm_epochs: int = 20,
                     lstm_batch: int = 32,
                     quiet: bool = False):
@@ -2325,13 +2299,8 @@ class StockForecasterCLI:
             candles=candles,
             val_horizon=val_horizon,
             forecast_horizon=forecast_horizon,
-            use_prophet=use_prophet,
-            use_xgboost=use_xgboost,
             use_lstm=use_lstm,
-            use_cnn_lstm=use_cnn_lstm,
-            use_attention_lstm=use_attention_lstm,
             use_random_forest=use_random_forest,
-            use_lightgbm=use_lightgbm,
             lstm_epochs=lstm_epochs,
             lstm_batch=lstm_batch,
             output_dir="outputs",
@@ -2358,23 +2327,14 @@ class StockForecasterCLI:
             df = self.data_fetcher.fetch_data(ticker, timeframe, candles)
 
         # Optimized snippet
-        last_candle = df.iloc[-1]
         features = self.feature_engieer.add_all_indicators(df, cfg)
         results = OHLCVPredictor(df, cfg, features).run_forecasts()
-
-        # Compute features, strategies, and signals
+        json_path, plot_path = self.output_engineer.save_outputs(df, results, cfg)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         
-
-        # Pack results cleanly
-        response = {
-            "candle": {
-                col: float(last_candle.get(col, 0))  # safe conversion to float
-                for col in ["Open", "High", "Low", "Close"]
-            },
-            "results": results
-        }
-
-        self.output_engineer.save_outputs(df, response, cfg)
+        if console and not quiet:
+            console.print(f"[green]Saved JSON →[/green] {json_path}")
+            console.print(f"[green]Saved PLOT →[/green] {plot_path}")
         
 
         # Timing
@@ -2392,51 +2352,35 @@ class StockForecasterCLI:
         def predict(
             ticker: str = typer.Option(..., help="Ticker symbol, e.g., AAPL"),
             timeframe: str = typer.Option("1d", help="One of: 1m,5m,15m,30m,1h,1d"),
-            candles: int = typer.Option(360, help="Number of historical candles to fetch (default 360)"),
-            val_horizon: int = typer.Option(36, help="Validation horizon (bars)"),
-            forecast_horizon: int = typer.Option(4, help="Forecast horizon (steps)"),
-            use_prophet: bool = typer.Option(False, help="Enable Prophet model if installed"),
-            use_xgboost: bool = typer.Option(True, help="Enable XGBoost if installed"),
+            candles: int = typer.Option(180, help="Number of historical candles to fetch (default 360)"),
+            val_horizon: int = typer.Option(18, help="Validation horizon (bars)"),
+            forecast_horizon: int = typer.Option(5, help="Forecast horizon (steps)"),
             use_lstm: bool = typer.Option(True, help="Enable LSTM (requires TensorFlow)"),
-            use_cnn_lstm: bool = typer.Option(False, help="Enable CNN-LSTM (requires TensorFlow)"),
-            use_attention_lstm: bool = typer.Option(True, help="Enable ATT-LSTM (requires TensorFlow)"),
             use_random_forest: bool = typer.Option(True, help="Enable RandomForest"),
-            use_lightgbm: bool = typer.Option(True, help="Enable LightGBM"),
-            lstm_epochs: int = typer.Option(20, help="LSTM epochs"),
+            lstm_epochs: int = typer.Option(100, help="LSTM epochs"),
             lstm_batch: int = typer.Option(32, help="LSTM batch size"),
             quiet: bool = typer.Option(False, help="Quiet mode")
         ):
-            self.run_predict(ticker, timeframe, candles, val_horizon, forecast_horizon,
-                             use_prophet, use_xgboost, use_lstm, use_cnn_lstm,
-                             use_attention_lstm, use_random_forest, use_lightgbm,
-                             lstm_epochs, lstm_batch, quiet)
+            self.run_predict(ticker, timeframe, candles, val_horizon, forecast_horizon, use_lstm, use_random_forest, lstm_epochs, lstm_batch, quiet)
 
     def main_argparse(self):
         """Argparse fallback if Typer is not used"""
         parser = argparse.ArgumentParser(description="StockForecaster CLI")
         parser.add_argument("--ticker", required=True)
         parser.add_argument("--timeframe", default="1d", choices=list(self.PERIOD_FOR_INTERVAL.keys()))
-        parser.add_argument("--candles", type=int, default=360)
-        parser.add_argument("--val-horizon", type=int, default=36)
-        parser.add_argument("--forecast-horizon", type=int, default=4)
-        parser.add_argument("--no-prophet", dest="use_prophet", action="store_false")
-        parser.add_argument("--no-xgb", dest="use_xgboost", action="store_false")
+        parser.add_argument("--candles", type=int, default=180)
+        parser.add_argument("--val-horizon", type=int, default=18)
+        parser.add_argument("--forecast-horizon", type=int, default=5)
         parser.add_argument("--no-lstm", dest="use_lstm", action="store_false")
-        parser.add_argument("--cnn-lstm", dest="use_cnn_lstm", action="store_false")
-        parser.add_argument("--att-lstm", dest="use_attention_lstm", action="store_false")
-        parser.add_argument("--random-forest", dest="use_random_forest", action="store_false")
-        parser.add_argument("--lightgbm", dest="use_lightgbm", action="store_false")
-        parser.add_argument("--lstm-epochs", type=int, default=20)
+        parser.add_argument("--no-random-forest", dest="use_random_forest", action="store_false")
+        parser.add_argument("--lstm-epochs", type=int, default=100)
         parser.add_argument("--lstm-batch", type=int, default=32)
         parser.add_argument("--quiet", action="store_true")
         args = parser.parse_args()
 
         self.run_predict(args.ticker, args.timeframe, args.candles,
-                         args.val_horizon, args.forecast_horizon,
-                         args.use_prophet, args.use_xgboost, args.use_lstm,
-                         args.use_cnn_lstm, args.use_attention_lstm,
-                         args.use_random_forest, args.use_lightgbm,
-                         args.lstm_epochs, args.lstm_batch, args.quiet)
+                         args.val_horizon, args.forecast_horizon, args.use_lstm,
+                         args.use_random_forest, args.lstm_epochs, args.lstm_batch, args.quiet)
 
     def run(self):
         """Entry point for the CLI"""

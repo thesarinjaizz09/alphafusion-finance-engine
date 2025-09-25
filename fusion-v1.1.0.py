@@ -932,31 +932,25 @@ def get_future_timestamps(df: pd.DataFrame, horizon: int) -> list:
                          periods=horizon,
                          freq=freq).tolist()
 
-def timedelta_from_freq(freq: str) -> pd.Timedelta:
-    """
-    Convert pandas frequency string to Timedelta-compatible arguments.
-    Example: '1D' -> pd.Timedelta(days=1), '5h' -> pd.Timedelta(hours=5)
-    """
+def normalize_freq(freq: str) -> str:
+    """Map yfinance/pandas shorthand to safe pandas offsets."""
+    mapping = {
+        "m": "min",    # lowercase m = minutes
+        "h": "H",      # hours
+        "d": "D",      # days
+        "wk": "W",     # weeks
+        "mo": "MS",    # month start (use 'M' for month end)
+    }
+    
     import re
     match = re.match(r"(\d+)([A-Za-z]+)", freq)
     if not match:
-        raise ValueError(f"Invalid frequency string: {freq}")
+        return freq
     val, unit = match.groups()
-    val = int(val)
-    unit_map = {
-        'D': 'days',
-        'd': 'days',
-        'H': 'hours',
-        'h': 'hours',
-        'T': 'minutes',  # T is pandas alias for min
-        'm': 'minutes',
-        'M': 'minutes',
-        'S': 'seconds',
-        's': 'seconds'
-    }
-    if unit not in unit_map:
-        raise ValueError(f"Unsupported freq unit: {unit}")
-    return pd.Timedelta(**{unit_map[unit]: val})
+    unit = unit.lower()
+    if unit in mapping:
+        return f"{val}{mapping[unit]}"
+    return freq
 
 def train_lstm_model(X_seq_train, y_seq_train_scaled, lookback, n_features, cfg, scaler_y, X_seq_val=None, y_seq_val_scaled=None, target_name=None, progress_queue=None):
     model = build_small_lstm((lookback, n_features), units=128)
@@ -1400,12 +1394,23 @@ def forecast_univariate(series: pd.Series,
     if progress_queue: progress_queue.put({"target": target_name, "status": "Formatting Next Predictions..."})
     
     last_time = series.index[-1]
-    freq = pd.infer_freq(series.index) or '1D'
+    freq = normalize_freq(cfg.timeframe)  # e.g. '1h', '5min', '1d'
+
+    # Generate future timestamps correctly aligned with the timeframe
     future_timestamps = pd.date_range(
-        start=last_time + timedelta_from_freq(freq),
-        periods=forecast_h, freq=freq).tolist()
-    next_preds = {model: {str(ts): float(pred) for ts, pred in zip(future_timestamps, arr)}
-                  for model, arr in forecast_by_model.items()}
+        start=last_time,
+        periods=forecast_h + 1,   # include the last_time + forecast_h steps
+        freq=freq
+    ).tolist()[1:]  # skip the first one because it's just last_time
+
+    # Map forecasts to timestamps
+    next_preds = {
+        model: {
+            str(ts): float(pred)
+            for ts, pred in zip(future_timestamps, arr)
+        }
+        for model, arr in forecast_by_model.items()
+    }
     
      # --- NEW: run strategy detectors for this target, add to results ---
     strategies = {}
@@ -2281,7 +2286,7 @@ if USE_TYPER:
         use_xgboost: bool = typer.Option(True, help="Enable XGBoost if installed"),
         use_lstm: bool = typer.Option(True, help="Enable LSTM (requires TensorFlow)"),
         use_cnn_lstm: bool = typer.Option(False, help="Enable CNN-LSTM (requires TensorFlow)"),
-        use_attention_lstm: bool = typer.Option(True, help="Enable ATT-LSTM (requires TensorFlow)"),
+        use_attention_lstm: bool = typer.Option(False, help="Enable ATT-LSTM (requires TensorFlow)"),
         use_random_forest: bool = typer.Option(True, help="Enable RandomForest Regressor (requires TensorFlow)"),
         use_lightgbm: bool = typer.Option(True, help="Enable ATT-LSTM (requires TensorFlow)"),
         lstm_epochs: int = typer.Option(20, help="LSTM epochs"),
