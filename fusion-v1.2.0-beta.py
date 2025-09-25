@@ -82,10 +82,12 @@ warnings.filterwarnings("ignore", category=UserWarning)
 try:
     from rich import print as rprint
     from rich.live import Live
-    from rich.console import Console
+    from rich.console import Console, RenderableType
     from rich.table import Table
     from rich.panel import Panel
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+    from rich.progress import Progress, SpinnerColumn, Task, TextColumn, ProgressColumn
+    from rich.spinner import Spinner
+    from rich.text import Text
     from rich.traceback import install as rich_install
     rich_install()
     console = Console()
@@ -218,6 +220,14 @@ def inverse_error_weights(y_true: np.ndarray, preds_dict: Dict[str, np.ndarray])
         return {k: 1.0 / n for k in preds_dict.keys()}
     return {k: float(v / denom) for k, v in weights.items()}
 
+#-----UTILITES------
+class SpinnerOrTickColumn(ProgressColumn):
+    """Show spinner while running, tick when finished."""
+
+    def render(self, task: Task) -> RenderableType:
+        if task.finished:
+            return Text("✔", style="green")
+        return Spinner("dots", style="cyan")
 
 @dataclass
 class CLIConfig:
@@ -342,7 +352,7 @@ class FeatureEngineer:
             raise ValueError("DataFrame must contain 'Open', 'High', 'Low', 'Close', 'Volume' columns")
         
         if console and not cfg.quiet:
-            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as prog:
+            with Progress(SpinnerOrTickColumn(), TextColumn("[progress.description]{task.description}")) as prog:
                 t = prog.add_task("Initiating indicators engineer...", total=None)
                 try:
                     # Add all technical indicators
@@ -354,7 +364,7 @@ class FeatureEngineer:
                     # Add other features
                     df = self._add_time_features(df)
                     df = self._add_price_features(df)
-                    prog.update(t, description=f"Engineered 80+ indicators.") 
+                    prog.update(t, description=f"[green]✔ Engineered 80+ indicators.") 
                 except Exception as e:
                     prog.stop()
                     logger.error(f"Failed to detect indicators: {e}")
@@ -2192,19 +2202,17 @@ class ForecastUnivariate:
 
         return next_preds, self.metrics, self.weights
 
-
 class OHLCVPredictor:
-    def __init__(self, df: pd.DataFrame, cfg):
+    def __init__(self, df: pd.DataFrame, cfg, features: pd.DataFrame):    
         console.print()
-        console.rule(f"[bold cyan]Forecast Progress", align='left')
-        
+        console.rule(f"[bold cyan]Forecast Progress", align='left')    
         self.df = df
         self.cfg = cfg
         self.targets = ["Open", "High", "Low", "Close"]
         self.manager = Manager()
         self.progress_queue = self.manager.Queue()
         self.results = {}
-        self.features = FeatureEngineer().add_all_indicators(self.df, self.cfg)
+        self.features = features
 
         # Count total steps per target (roughly # of models per target)
         self.total_steps = 20 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta
@@ -2236,7 +2244,7 @@ class OHLCVPredictor:
                 bar.set_postfix_str(status)
                 bar.refresh()
 
-    def run_forecasts(self):
+    def run_forecasts(self):        
         # Start queue reader thread
         reader_thread = threading.Thread(target=self._queue_reader, daemon=True)
         reader_thread.start()
@@ -2334,7 +2342,7 @@ class StockForecasterCLI:
 
         # Fetch candles
         if console and not quiet:
-            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as prog:
+            with Progress(SpinnerOrTickColumn(), TextColumn("[progress.description]{task.description}")) as prog:
                 t = prog.add_task("Fetching market data...", total=None)
                 try:
                     df = self.data_fetcher.fetch_data(ticker, timeframe, candles)
@@ -2342,13 +2350,15 @@ class StockForecasterCLI:
                     prog.stop()
                     logger.error(f"Failed to fetch data: {e}")
                     raise
-                prog.update(t, description=f"Fetched {len(df)} rows")
+                prog.stop_task(t)
+                prog.update(t, description=f"[green]✔ Fetched {len(df)} rows")
         else:
             df = self.data_fetcher.fetch_data(ticker, timeframe, candles)
 
         # Optimized snippet
         last_candle = df.iloc[-1]
-        results = OHLCVPredictor(df, cfg).run_forecasts()
+        features = self.feature_engieer.add_all_indicators(df, cfg)
+        results = OHLCVPredictor(df, cfg, features).run_forecasts()
 
         # Compute features, strategies, and signals
         
