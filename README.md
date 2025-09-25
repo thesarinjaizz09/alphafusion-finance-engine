@@ -1,4 +1,4 @@
-# ⚡ AlphaFusion
+# ⚡ AlphaFusion Finance
 
 > **AI-Powered Multi-Model Stock Forecasting & Trading Intelligence**, 
 > *Next-generation financial analytics with modular, explainable, and production-ready AI.*
