@@ -220,7 +220,7 @@ def inverse_error_weights(y_true: np.ndarray, preds_dict: Dict[str, np.ndarray])
         return {k: 1.0 / n for k in preds_dict.keys()}
     return {k: float(v / denom) for k, v in weights.items()}
 
-<<<<<<< HEAD
+
 #-----UTILITES------
 class SpinnerOrTickColumn(ProgressColumn):
     """Show spinner while running, tick when finished."""
@@ -229,8 +229,6 @@ class SpinnerOrTickColumn(ProgressColumn):
         if task.finished:
             return Text("✔", style="green")
         return Spinner("dots", style="cyan")
-=======
->>>>>>> 08ea8db6cd931273742a11339a8c35c005a8a8be
 
 @dataclass
 class CLIConfig:
@@ -2205,30 +2203,18 @@ class ForecastUnivariate:
 
         return next_preds, self.metrics, self.weights
 
-<<<<<<< HEAD
 class OHLCVPredictor:
     def __init__(self, df: pd.DataFrame, cfg, features: pd.DataFrame):    
         console.print()
         console.rule(f"[bold cyan]Forecast Progress", align='left')    
-=======
-
-class OHLCVPredictor:
-    def __init__(self, df: pd.DataFrame, cfg):
-        console.print()
-        console.rule(f"[bold cyan]Forecast Progress", align='left')
-        
->>>>>>> 08ea8db6cd931273742a11339a8c35c005a8a8be
         self.df = df
         self.cfg = cfg
         self.targets = ["Open", "High", "Low", "Close"]
         self.manager = Manager()
         self.progress_queue = self.manager.Queue()
         self.results = {}
-<<<<<<< HEAD
         self.features = features
-=======
-        self.features = FeatureEngineer().add_all_indicators(self.df, self.cfg)
->>>>>>> 08ea8db6cd931273742a11339a8c35c005a8a8be
+
 
         # Count total steps per target (roughly # of models per target)
         self.total_steps = 20 + cfg.lstm_epochs  # EMA, SARIMA, Prophet, XGBoost, RF, LGBM, LSTM, CNN-LSTM, Attn-LSTM, Meta
@@ -2260,11 +2246,7 @@ class OHLCVPredictor:
                 bar.set_postfix_str(status)
                 bar.refresh()
 
-<<<<<<< HEAD
-    def run_forecasts(self):        
-=======
     def run_forecasts(self):
->>>>>>> 08ea8db6cd931273742a11339a8c35c005a8a8be
         # Start queue reader thread
         reader_thread = threading.Thread(target=self._queue_reader, daemon=True)
         reader_thread.start()
@@ -2377,12 +2359,8 @@ class StockForecasterCLI:
 
         # Optimized snippet
         last_candle = df.iloc[-1]
-<<<<<<< HEAD
         features = self.feature_engieer.add_all_indicators(df, cfg)
         results = OHLCVPredictor(df, cfg, features).run_forecasts()
-=======
-        results = OHLCVPredictor(df, cfg).run_forecasts()
->>>>>>> 08ea8db6cd931273742a11339a8c35c005a8a8be
 
         # Compute features, strategies, and signals
         
