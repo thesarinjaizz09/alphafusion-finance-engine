@@ -586,7 +586,7 @@ class StrategiesEngineer:
         target_df = df.copy()
         
         if console and not cfg.quiet:
-            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as prog:
+            with Progress(SpinnerOrTickColumn(), TextColumn("[progress.description]{task.description}")) as prog:
                 t = prog.add_task("Initiating strategies engineer...", total=None)
                 try:
                     self.strategies["breakout"] = self.detect_breakout(target_df, target_col=target_name)
@@ -616,6 +616,7 @@ class StrategiesEngineer:
                     self.strategies["bollinger_strategy"] = self.detect_bollinger_strategy(target_df) if hasattr(cfg, 'ticker') else None
                     # Extra pro indicators
                     self.detect_extra_strategies(target_df)
+                    prog.stop_task(t)
                     prog.update(t, description=f"Engineered 30+ strategies.")
                     return self.strategies
                 except Exception as e:
@@ -2047,7 +2048,8 @@ class MLSignalAggregator:
 
     def generate(self, strategy_json: Dict[str, Any], history_acc: float = 0.8) -> Dict[str, Any]:
         flat = self.flatten_json(strategy_json)
-        return self.predict_signal(flat, history_acc)
+        return flat
+        # return self.predict_signal(flat, history_acc)
 
 class OutputManager:
     def __init__(self):
@@ -2763,6 +2765,7 @@ class StockForecasterCLI:
         self.PERIOD_FOR_INTERVAL = PERIOD_FOR_INTERVAL
         self.output_engineer = OutputManager()
         self.strategies_engineer = StrategiesEngineer()
+        self.strategies_aggregator = MLSignalAggregator()
 
     def run_predict(self,
                     ticker: str,
@@ -2819,6 +2822,9 @@ class StockForecasterCLI:
         #     console.print(f"[green]Saved JSON →[/green] {json_path}")
         #     console.print(f"[green]Saved PLOT →[/green] {plot_path}")
         strategies = self.strategies_engineer.detect_all_strategies(df, cfg)
+        flattend_json = self.strategies_aggregator.generate(strategies, )
+        with open('flatten_dump.json', "w") as f:
+            json.dump(flattend_json, f, indent=4, cls=NumpyEncoder)
         with open('dump.json', "w") as f:
             json.dump(strategies, f, indent=4, cls=NumpyEncoder)
         

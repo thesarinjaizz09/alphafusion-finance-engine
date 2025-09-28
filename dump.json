@@ -37,7 +37,10 @@
     },
     "swing": {
         "signal": "none",
-        "reasons": []
+        "reasons": [],
+        "confidence": 0.0,
+        "stop_loss": null,
+        "take_profit": null
     },
     "scalping_helper": {
         "signal": "none",
@@ -45,12 +48,15 @@
         "reason": null
     },
     "regime": {
-        "signal": "medium_volatility",
+        "volatility": "medium_volatility",
         "reason": "Trending regime with controlled volatility",
-        "trend": "bullish",
-        "vol_spike": false
+        "signal": "bullish",
+        "vol_spike": false,
+        "confidence": 0.63,
+        "stop_loss": 248.01157155400696,
+        "take_profit": 270.35687703358764
     },
-    "options_summary": {
+    "options": {
         "expiries": [
             "2025-10-03",
             "2025-10-10",
