@@ -1391,6 +1391,1111 @@ class StrategiesEngineer:
         except Exception:
             self.strategies["hma"] = None
 
+class StrategiesEngineerPro:
+    """Compute advanced trading strategies using TA indicators + custom rules."""
+
+    def __init__(self, df: pd.DataFrame, target_col: str = "Close"):
+        self.df = df.copy()
+        self.target_col = target_col
+        self.indicators: Dict[str, pd.Series] = {}
+        self.strategies: Dict[str, dict] = {}
+        self._precompute_indicators()
+        
+    # ----------------------
+    # Precompute Indicators
+    # ----------------------
+    def _precompute_indicators(self):
+        """Precompute heavy indicators once for efficiency."""
+        c = self.df[self.target_col]
+        h, l = self.df["High"], self.df["Low"]
+        v = self.df["Volume"] if "Volume" in self.df.columns else None
+
+        try:
+            self.indicators["ema20"] = tlb.EMA(c, timeperiod=20)
+            self.indicators["ema50"] = tlb.EMA(c, timeperiod=50)
+            self.indicators["ema12"] = tlb.EMA(c, timeperiod=12)
+            self.indicators["ema26"] = tlb.EMA(c, timeperiod=26)
+
+            macd, macd_signal, _ = tlb.MACD(c, fastperiod=12, slowperiod=26, signalperiod=9)
+            self.indicators["macd"] = macd
+            self.indicators["macd_signal"] = macd_signal
+
+            self.indicators["rsi14"] = tlb.RSI(c, timeperiod=14)
+            self.indicators["atr14"] = tlb.ATR(h, l, c, timeperiod=14)
+
+            self.indicators["bb_up"], self.indicators["bb_mid"], self.indicators["bb_low"] = tlb.BBANDS(
+                c, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0
+            )
+
+            self.indicators["donchian_high"] = h.rolling(window=20).max()
+            self.indicators["donchian_low"] = l.rolling(window=20).min()
+
+            self.indicators["zscore20"] = (c - c.rolling(20).mean()) / c.rolling(20).std()
+            self.indicators["volume_ma20"] = v.rolling(20).mean() if v is not None else None
+        except Exception as e:
+            raise RuntimeError(f"Error precomputing indicators: {e}")
+
+    # ----------------------
+    # Helper: fetch indicator
+    # ----------------------
+    def _get(self, name: str) -> Optional[pd.Series]:
+        return self.indicators.get(name)
+
+    # ----------------------
+    # Standardized output
+    # ----------------------
+    def _format(self, strategy: str, signal: str, confidence: float = 0.0,
+            reasons: Optional[List[str]] = None, entry: Optional[float] = None,
+            stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
+            trend: Optional[str] = None, volume_spike: Optional[bool] = None) -> dict:
+        return {
+            "strategy": strategy,
+            "signal": signal,
+            "confidence": float(np.clip(confidence, 0.0, 1.0)),
+            "reasons": reasons if isinstance(reasons, list) else ([reasons] if reasons else []),
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "trend": trend,
+            "volume_spike": volume_spike
+        }
+
+    # ----------------------
+    # Market Regime Strategy
+    # ----------------------
+    def detect_market_regime(self, df: pd.DataFrame, window: int = 20) -> dict:
+        """Detects volatility regime using ATR, EMA trend, and volume."""
+        df = self.df
+        if len(df) < window:
+            return self._format("market_regime", "none", reasons="Not enough data")
+
+        try:
+            atr = self._get("atr14")
+            ema20 = self._get("ema20")
+            ema50 = self._get("ema50")
+            returns_vol = df[self.target_col].pct_change().rolling(window).std()
+            avg_vol = df["Volume"].rolling(window).mean()
+
+            # Trend detection
+            diff = (ema20.iloc[-1] - ema50.iloc[-1]) / ema50.iloc[-1]
+            if abs(diff) < 0.002:
+                trend = "sideways"
+            elif ema20.iloc[-1] > ema50.iloc[-1]:
+                trend = "bullish"
+            else:
+                trend = "bearish"
+
+            vol_spike = df["Volume"].iloc[-1] > 1.5 * avg_vol.iloc[-1]
+
+            # Volatility regime
+            if returns_vol.iloc[-1] < 0.005 and atr.iloc[-1] < 0.01 * df[self.target_col].iloc[-1]:
+                signal = "low_volatility"
+                reason = "Sideways regime / accumulation"
+            elif returns_vol.iloc[-1] < 0.02:
+                signal = "medium_volatility"
+                reason = "Trending regime with controlled volatility"
+            else:
+                signal = "high_volatility"
+                reason = "Explosive volatility regime"
+
+            confidence = max(0.0, min(1.0, 1 - (returns_vol.iloc[-1] / 0.05)))
+
+            stop_loss = df[self.target_col].iloc[-1] - 1.5 * atr.iloc[-1] if trend == "bullish" else df[self.target_col].iloc[-1] + 1.5 * atr.iloc[-1]
+            take_profit = df[self.target_col].iloc[-1] + 3 * atr.iloc[-1] if trend == "bullish" else df[self.target_col].iloc[-1] - 3 * atr.iloc[-1]
+
+            return self._format(
+                strategy="market_regime",
+                signal=signal,
+                confidence=confidence,
+                reasons=[reason],
+                entry=df[self.target_col].iloc[-1],
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trend=trend,
+                volume_spike=vol_spike
+            )
+        except Exception as e:
+            return self._format("market_regime", "error", reasons=str(e), trend=None, volume_spike=None)
+
+    # ----------------------
+    # Breakout Strategy
+    # ----------------------
+    def detect_breakout(self, df: pd.DataFrame, vol_mult: float = 2.0, target_col: str = "Close") -> dict:
+        """
+        Detect breakout using Bollinger Bands, Donchian Channels, ATR, volume, and EMA trend.
+        Returns standardized output including trend, volume spike, confidence, and risk levels.
+        """
+        if len(df) < 50:
+            return self._format(
+                strategy="breakout",
+                signal="none",
+                reasons="Not enough data",
+                trend=None,
+                volume_spike=None
+            )
+
+        try:
+            c = df[target_col]
+            h, l, v = df["High"], df["Low"], df["Volume"]
+
+            # Use precomputed indicators if available
+            upper_bb = self._get("bb_up") if self._get("bb_up") is not None else tlb.BBANDS(c, timeperiod=20)[0]
+            lower_bb = self._get("bb_low") if self._get("bb_low") is not None else tlb.BBANDS(c, timeperiod=20)[2]
+            ema20 = self._get("ema20") if self._get("ema20") is not None else tlb.EMA(c, timeperiod=20)
+            atr = self._get("atr14") if self._get("atr14") is not None else tlb.ATR(h, l, c, timeperiod=14)
+            upper_dc = h.rolling(20).max()
+            lower_dc = l.rolling(20).min()
+
+            # Last scalar values
+            last = c.iat[-1]
+            last_upper_bb, last_lower_bb = upper_bb.iat[-1], lower_bb.iat[-1]
+            last_ema20, last_atr = ema20.iat[-1], atr.iat[-1]
+            last_upper_dc, last_lower_dc = upper_dc.iat[-1], lower_dc.iat[-1]
+
+            # Trend detection
+            trend = "bullish" if last > last_ema20 else "bearish" if last < last_ema20 else "sideways"
+
+            # Volume spike
+            avg_vol = v.rolling(20).mean().iat[-1]
+            volume_spike = v.iat[-1] > vol_mult * avg_vol
+
+            # Volatility baseline
+            vol_std = c.pct_change().rolling(14).std().iat[-1]
+
+            # Initialize output
+            signal, reasons, confidence = "none", [], 0.0
+
+            # Bullish breakout
+            if last > last_upper_bb and last > last_upper_dc and last > last_ema20 and last_atr > vol_std:
+                signal = "bullish"
+                reasons = ["Price > BB upper", "Price > Donchian high", "Above EMA20", "ATR confirms volatility"]
+                confidence = min(1.0, (last - last_ema20) / last_atr + (0.2 if volume_spike else 0))
+
+            # Bearish breakout
+            elif last < last_lower_bb and last < last_lower_dc and last < last_ema20 and last_atr > vol_std:
+                signal = "bearish"
+                reasons = ["Price < BB lower", "Price < Donchian low", "Below EMA20", "ATR confirms volatility"]
+                confidence = min(1.0, (last_ema20 - last) / last_atr + (0.2 if volume_spike else 0))
+
+            # Risk management
+            stop_loss, take_profit = None, None
+            if signal == "bullish":
+                stop_loss = last - 2 * last_atr
+                take_profit = last + 3 * last_atr
+            elif signal == "bearish":
+                stop_loss = last + 2 * last_atr
+                take_profit = last - 3 * last_atr
+
+            # Return standardized output
+            return self._format(
+                strategy="breakout",
+                signal=signal,
+                confidence=round(confidence, 2),
+                reasons=reasons if reasons else ["No breakout detected"],
+                entry=last,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trend=trend,
+                volume_spike=volume_spike
+            )
+        except Exception as e:
+            return self._format(
+                strategy="breakout",
+                signal="error",
+                reasons=str(e),
+                trend=None,
+                volume_spike=None
+            )
+
+    # ----------------------
+    # Mean Reversion Strategy
+    # ----------------------
+    def detect_mean_reversion(self, df: pd.DataFrame, target_col: str = "Close") -> dict:
+        """Detect mean reversion with RSI, Bollinger Bands, Z-score, and volume (TA-Lib version) with uniform output."""
+        try:
+            if len(df) < 20:
+                return self._format(
+                    strategy="mean_reversion",
+                    signal="none",
+                    confidence=0.0,
+                    reasons=["not enough data"],
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    volume_spike=False,
+                    trend="sideways"
+                )
+
+            # Precomputed or calculate indicators
+            rsi_series = self._get("rsi14") if self._get("rsi14") is not None else tlb.RSI(df[target_col], timeperiod=14)
+            rsi = rsi_series.iloc[-1]  # always the last value
+            upper_bb, middle_bb, lower_bb = tlb.BBANDS(df[target_col], timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+            mean = df[target_col].rolling(20).mean().iloc[-1]
+            std = df[target_col].rolling(20).std().iloc[-1]
+            last = df[target_col].iloc[-1]
+            z = ((df[target_col] - df[target_col].rolling(20).mean()) / df[target_col].rolling(20).std()).iloc[-1]
+
+            vol_spike = df['Volume'].iloc[-1] > 1.5 * df['Volume'].rolling(20).mean().iloc[-1]
+
+            # Trend detection (bullish / bearish / sideways)
+            ema20 = self._get("ema20") if self._get("ema20") is not None else tlb.EMA(df[target_col], timeperiod=20)
+            ema50 = self._get("ema50") if self._get("ema50") is not None else tlb.EMA(df[target_col], timeperiod=50)
+            if ema20.iloc[-1] > ema50.iloc[-1]:
+                trend = "bullish"
+            elif ema20.iloc[-1] < ema50.iloc[-1]:
+                trend = "bearish"
+            else:
+                trend = "sideways"
+
+            # Conditions
+            reasons, signal, confidence = [], "none", 0.0
+            if rsi > 70: reasons.append("RSI_overbought")
+            elif rsi < 30: reasons.append("RSI_oversold")
+            if last >= upper_bb.iloc[-1]: reasons.append("BB_upper_touch")
+            if last <= lower_bb.iloc[-1]: reasons.append("BB_lower_touch")
+            if z > 2: reasons.append("Zscore_high")
+            elif z < -2: reasons.append("Zscore_low")
+
+            if any(x in reasons for x in ["RSI_oversold", "BB_lower_touch", "Zscore_low"]):
+                signal = "buy_revert"
+                confidence = min(1.0, abs(z) / 3 + 0.2)
+            elif any(x in reasons for x in ["RSI_overbought", "BB_upper_touch", "Zscore_high"]):
+                signal = "sell_revert"
+                confidence = min(1.0, z / 3 + 0.2)
+
+            # Risk management
+            stop_loss = last + 2 * std if signal == "buy_revert" else last - 2 * std if signal == "sell_revert" else None
+            take_profit = mean if signal in ["buy_revert", "sell_revert"] else None
+
+            return self._format(
+                strategy="mean_reversion",
+                signal=signal,
+                confidence=round(confidence, 2),
+                reasons=reasons,
+                entry=last,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                volume_spike=vol_spike,
+                trend=trend
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="mean_reversion",
+                signal="none",
+                confidence=0.0,
+                reasons=[f"error: {str(e)}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                volume_spike=False,
+                trend="sideways"
+            )
+
+
+    def detect_fibonacci_pullback(self) -> dict:
+        """Detect Fibonacci pullback (template)"""
+        return self._format("fibonacci", "none")
+
+    # ----------------------
+    # Price Action Strategy
+    # ----------------------
+    def detect_price_action(self, df: pd.DataFrame, idx_offset: int = 0) -> dict:
+        """Detect candlestick patterns with volume confirmation and uniform output."""
+        try:
+            if len(df) < 2:
+                return self._format(
+                    strategy="price_action",
+                    signal="none",
+                    confidence=0.0,
+                    reasons=["not enough data"],
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    volume_spike=False,
+                    trend="sideways"
+                )
+
+            idx = len(df) - 1 - idx_offset
+            last = df.iloc[idx]
+            prev = df.iloc[idx - 1]
+
+            vol_spike = df["Volume"].iloc[-1] > 1.5 * df["Volume"].rolling(20).mean().iloc[-1]
+
+            bullish_engulfing = last["Close"] > last["Open"] and prev["Close"] < prev["Open"] and last["Close"] > prev["Open"]
+            bearish_engulfing = last["Close"] < last["Open"] and prev["Close"] > prev["Open"] and last["Close"] < prev["Open"]
+            pinbar = abs(last["Close"] - last["Open"]) < (last["High"] - last["Low"]) * 0.25
+
+            # Confidence based on candle body vs range
+            body_size = abs(last['Close'] - last['Open'])
+            range_size = last['High'] - last['Low']
+            confidence = round(body_size / range_size if range_size != 0 else 0, 2)
+
+            # Determine main signal
+            if bullish_engulfing:
+                signal = "bullish"
+                reasons = ["bullish_engulfing"]
+                entry = last["Close"]
+                stop_loss = last["Low"]
+                take_profit = last["Close"] + (last["Close"] - last["Low"]) * 2  # 2:1 RR
+            elif bearish_engulfing:
+                signal = "bearish"
+                reasons = ["bearish_engulfing"]
+                entry = last["Close"]
+                stop_loss = last["High"]
+                take_profit = last["Close"] - (last["High"] - last["Close"]) * 2  # 2:1 RR
+            elif pinbar:
+                signal = "pin_bar"
+                reasons = ["pin_bar"]
+                entry = last["Close"]
+                stop_loss = last["Low"] if last["Close"] > last["Open"] else last["High"]
+                take_profit = last["Close"] + (last["Close"] - stop_loss) * 2
+            else:
+                signal = "none"
+                reasons = ["no clear pattern"]
+                entry = stop_loss = take_profit = None
+
+            # Trend detection
+            ema20 = self._get("ema20") if self._get("ema20") is not None else tlb.EMA(df["Close"], timeperiod=20)
+            ema50 = self._get("ema50") if self._get("ema50") is not None else tlb.EMA(df["Close"], timeperiod=50)
+            if ema20.iloc[-1] > ema50.iloc[-1]:
+                trend = "bullish"
+            elif ema20.iloc[-1] < ema50.iloc[-1]:
+                trend = "bearish"
+            else:
+                trend = "sideways"
+
+            return self._format(
+                strategy="price_action",
+                signal=signal,
+                confidence=confidence,
+                reasons=reasons,
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                volume_spike=vol_spike,
+                trend=trend
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="price_action",
+                signal="none",
+                confidence=0.0,
+                reasons=[f"error: {str(e)}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                volume_spike=False,
+                trend="sideways"
+            )
+
+    # ----------------------
+    # Swing Trade Strategy
+    # ----------------------
+    def detect_swing_trade(self, df: pd.DataFrame, target_col: str = "Close") -> dict:
+        """Detect swing trades with EMA cross, MACD, RSI, ATR, volume, and standardized output."""
+        try:
+            if len(df) < 50:
+                return self._format(
+                    strategy="swing_trade",
+                    signal="none",
+                    confidence=0.0,
+                    reasons=["not enough data"],
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    volume_spike=False,
+                    trend="sideways"
+                )
+
+            ema12 = tlb.EMA(df[target_col], timeperiod=12)
+            ema26 = tlb.EMA(df[target_col], timeperiod=26)
+            macd, macd_signal, macd_hist = tlb.MACD(df[target_col], fastperiod=12, slowperiod=26, signalperiod=9)
+            rsi = tlb.RSI(df[target_col], timeperiod=14)
+            atr = tlb.ATR(df["High"], df["Low"], df["Close"], timeperiod=14)
+            avg_vol = df["Volume"].rolling(20).mean()
+
+            last_ema12 = ema12.iloc[-1]
+            last_ema26 = ema26.iloc[-1]
+            last_macd_hist = macd_hist.iloc[-1]
+            last_rsi = rsi.iloc[-1]
+            last_atr = atr.iloc[-1]
+            last_vol = df["Volume"].iloc[-1]
+            avg_vol_last = avg_vol.iloc[-1]
+
+            # Volume spike
+            vol_spike = last_vol > 1.5 * avg_vol_last
+
+            reasons, signal = [], "none"
+
+            # Bullish swing
+            if (
+                last_ema12 > last_ema26
+                and last_macd_hist > 0
+                and last_rsi < 70
+                and last_atr > 0
+                and last_vol > avg_vol_last
+            ):
+                signal = "bullish"
+                reasons = ["EMA cross up", "MACD positive", "RSI < 70", "ATR valid", "Volume confirmed"]
+
+            # Bearish swing
+            elif (
+                last_ema12 < last_ema26
+                and last_macd_hist < 0
+                and last_rsi > 30
+                and last_atr > 0
+                and last_vol > avg_vol_last
+            ):
+                signal = "bearish"
+                reasons = ["EMA cross down", "MACD negative", "RSI > 30", "ATR valid", "Volume confirmed"]
+
+            # Confidence: proportion of conditions met
+            conditions = [
+                last_ema12 > last_ema26 if signal == "bullish" else last_ema12 < last_ema26,
+                last_macd_hist > 0 if signal == "bullish" else last_macd_hist < 0,
+                (last_rsi < 70 if signal == "bullish" else last_rsi > 30),
+                last_atr > 0,
+                last_vol > avg_vol_last
+            ]
+            confidence = sum(conditions) / len(conditions) if signal != "none" else 0.0
+
+            # Entry, stop loss, take profit
+            entry = df[target_col].iloc[-1] if signal != "none" else None
+            stop_loss = entry - 1.5 * last_atr if signal == "bullish" else (
+                        entry + 1.5 * last_atr if signal == "bearish" else None)
+            take_profit = entry + 3 * last_atr if signal == "bullish" else (
+                        entry - 3 * last_atr if signal == "bearish" else None)
+
+            # Trend detection
+            ema20 = self._get("ema20") if self._get("ema20") is not None else tlb.EMA(df["Close"], timeperiod=20)
+            ema50 = self._get("ema50") if self._get("ema50") is not None else tlb.EMA(df["Close"], timeperiod=50)
+            if ema20.iloc[-1] > ema50.iloc[-1]:
+                trend = "bullish"
+            elif ema20.iloc[-1] < ema50.iloc[-1]:
+                trend = "bearish"
+            else:
+                trend = "sideways"
+
+            return self._format(
+                strategy="swing_trade",
+                signal=signal,
+                confidence=round(confidence, 2),
+                reasons=reasons,
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                volume_spike=vol_spike,
+                trend=trend
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="swing_trade",
+                signal="none",
+                confidence=0.0,
+                reasons=[f"error: {str(e)}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                volume_spike=False,
+                trend="sideways"
+            )
+
+    # ----------------------
+    # Scalping Strategy
+    # ----------------------
+    def detect_scalping_opportunity(self, df: pd.DataFrame, target_col: str = "Close") -> dict:
+        """Detect scalping opportunities using VWAP, RSI, StochRSI, volume, and standardized output."""
+        try:
+            if "VWAP" not in df.columns:
+                df["VWAP"] = (df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3).cumsum() / df["Volume"].cumsum()
+
+            last = df[target_col].iloc[-1]
+            vwap_last = df["VWAP"].iloc[-1]
+            sma5 = tlb.SMA(df[target_col], timeperiod=5)[-1]
+            sma20 = tlb.SMA(df[target_col], timeperiod=20)[-1]
+            avg_vol = df["Volume"].rolling(20).mean().iloc[-1]
+            rsi = tlb.RSI(df[target_col], timeperiod=14)[-1]
+            fastk, fastd = tlb.STOCHRSI(df[target_col], timeperiod=14, fastk_period=5, fastd_period=3, fastd_matype=0)
+            stochrsi = fastk[-1]
+
+            # Volume spike
+            vol_spike = df["Volume"].iloc[-1] > 1.5 * avg_vol
+
+            # Trend detection
+            ema20 = self._get("ema20") if self._get("ema20") is not None else tlb.EMA(df["Close"], timeperiod=20)
+            ema50 = self._get("ema50") if self._get("ema50") is not None else tlb.EMA(df["Close"], timeperiod=50)
+            if ema20.iloc[-1] > ema50.iloc[-1]:
+                trend = "bullish"
+            elif ema20.iloc[-1] < ema50.iloc[-1]:
+                trend = "bearish"
+            else:
+                trend = "sideways"
+
+            risk_pct = 0.003  # 0.3%
+            reward_multiple = 2.0
+            reasons, signal, confidence, entry, stop_loss, take_profit = [], "none", 0.0, None, None, None
+
+            # LONG SETUP
+            if last > vwap_last and df["Volume"].iloc[-1] > avg_vol and rsi < 70 and stochrsi > 0.5:
+                signal = "long_momentum"
+                reasons = ["VWAP above price", "Volume high", "RSI < 70", "StochRSI rising"]
+                confidence += 0.25 * sum([last > vwap_last, df["Volume"].iloc[-1] > avg_vol, rsi < 70, stochrsi > 0.5])
+                entry = round(last, 2)
+                stop_loss = round(last * (1 - risk_pct), 2)
+                take_profit = round(last * (1 + risk_pct * reward_multiple), 2)
+
+            # SHORT SETUP
+            elif last < vwap_last and df["Volume"].iloc[-1] > avg_vol and rsi > 30 and stochrsi < 0.5:
+                signal = "short_momentum"
+                reasons = ["VWAP below price", "Volume high", "RSI > 30", "StochRSI falling"]
+                confidence += 0.25 * sum([last < vwap_last, df["Volume"].iloc[-1] > avg_vol, rsi > 30, stochrsi < 0.5])
+                entry = round(last, 2)
+                stop_loss = round(last * (1 + risk_pct), 2)
+                take_profit = round(last * (1 - risk_pct * reward_multiple), 2)
+
+            return self._format(
+                strategy="scalping_opportunity",
+                signal=signal,
+                confidence=round(confidence, 2),
+                reasons=reasons if reasons else "No valid setup",
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                volume_spike=vol_spike,
+                trend=trend
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="scalping_opportunity",
+                signal="none",
+                confidence=0.0,
+                reasons=[f"error: {str(e)}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                volume_spike=False,
+                trend="sideways"
+            )
+
+    # ----------------------
+    # Options Strategy
+    # ----------------------
+    def fetch_options_flow_stub(self, ticker: str) -> dict:
+        """Fetch basic options flow data (open interest sums) using yfinance."""
+        out = {
+            "expiries": [],
+            "calls_oi_sum": None,
+            "puts_oi_sum": None
+        }
+        try:
+            tk = yf.Ticker(ticker)
+            exps = tk.options
+            if exps:
+                out["expiries"] = list(exps)
+                chain = tk.option_chain(out["expiries"][0])
+                calls, puts = chain.calls, chain.puts
+                if "openInterest" in calls.columns:
+                    out["calls_oi_sum"] = int(calls["openInterest"].sum())
+                if "openInterest" in puts.columns:
+                    out["puts_oi_sum"] = int(puts["openInterest"].sum())
+        except Exception as e:
+            logger.debug(f"Options scan failed for {ticker} (yfinance): {e}")
+        return out
+
+    # ----------------------
+    # Trend Strategy
+    # ----------------------
+    def detect_trend_strength(self, df: pd.DataFrame, target_col: str = "Close") -> dict:
+        """
+        Detect market trend strength using EMA10 vs EMA50,
+        with volume spike and market regime detection.
+        """
+        try:
+            if len(df) < 50:
+                return self._format(
+                    strategy="trend_strength",
+                    signal="none",
+                    confidence=0.0,
+                    reasons=["not enough data"],
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    trend=None,
+                    volume_spike=None,
+                )
+
+            # Use precomputed indicators if available
+            ema10 = self._get("ema10") if "ema10" in self.indicators else tlb.EMA(df[target_col], timeperiod=10)
+            ema50 = self._get("ema50") if "ema50" in self.indicators else tlb.EMA(df[target_col], timeperiod=50)
+            last_ema10 = ema10.iloc[-1]
+            last_ema50 = ema50.iloc[-1]
+
+            # Trend calculation
+            diff = last_ema10 - last_ema50
+            if diff > 0:
+                signal = "bull_trend"
+                trend = "bullish"
+            elif diff < 0:
+                signal = "bear_trend"
+                trend = "bearish"
+            else:
+                signal = "sideways"
+                trend = "sideways"
+
+            # Confidence: normalized EMA difference
+            confidence = float(np.clip(abs(diff) / last_ema50, 0.0, 1.0))
+
+            # Volume spike detection
+            vol_spike = df["Volume"].iloc[-1] > 1.5 * df["Volume"].rolling(20).mean().iloc[-1] if "Volume" in df.columns else False
+
+            # Entry, stop loss, take profit estimates (realistic)
+            atr = self._get("atr14") if "atr14" in self.indicators else tlb.ATR(df["High"], df["Low"], df["Close"], timeperiod=14)
+            last_atr = atr.iloc[-1]
+            last_price = df[target_col].iloc[-1]
+
+            entry = last_price
+            stop_loss = last_price - 1.5 * last_atr if signal == "bull_trend" else (last_price + 1.5 * last_atr if signal == "bear_trend" else None)
+            take_profit = last_price + 3 * last_atr if signal == "bull_trend" else (last_price - 3 * last_atr if signal == "bear_trend" else None)
+
+            return self._format(
+                strategy="trend_strength",
+                signal=signal,
+                confidence=confidence,
+                reasons=[f"EMA10 {'>' if diff>0 else '<' if diff<0 else '='} EMA50"],
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trend=trend,
+                volume_spike=vol_spike,
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="trend_strength",
+                signal="error",
+                confidence=0.0,
+                reasons=[f"Error in trend detection: {e}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                trend=None,
+                volume_spike=None,
+            )
+
+    # ----------------------
+    # Fibonacci Strategy
+    # ----------------------
+    def detect_fibonacci_pullback(self, df: pd.DataFrame, target_col: str = "Close") -> dict:
+        """
+        Detect Fibonacci pullbacks with ATR, trend, and EMA confirmation,
+        including precomputed indicators, uniform output, confidence,
+        realistic SL/TP, volume spike, and error handling.
+        """
+        try:
+            if len(df) < 50:
+                return self._format(
+                    strategy="fibonacci_pullback",
+                    signal="none",
+                    confidence=0.0,
+                    reasons=["not enough data"],
+                    entry=None,
+                    stop_loss=None,
+                    take_profit=None,
+                    trend=None,
+                    volume_spike=None,
+                )
+
+            # Price high/low range
+            high, low = df[target_col].max(), df[target_col].min()
+            diff = high - low
+
+            # Fibonacci retracement levels
+            levels = {
+                "0.236": high - 0.236 * diff,
+                "0.382": high - 0.382 * diff,
+                "0.5": high - 0.5 * diff,
+                "0.618": high - 0.618 * diff,
+                "0.786": high - 0.786 * diff,
+            }
+
+            last_price = df[target_col].iloc[-1]
+
+            # Nearest Fibonacci level
+            nearest_level_key, nearest_level_value = min(levels.items(), key=lambda x: abs(last_price - x[1]))
+
+            # ATR & EMA using precomputed if available
+            atr = self._get("atr14").iloc[-1] if "atr14" in self.indicators else tlb.ATR(df["High"], df["Low"], df["Close"], timeperiod=14).iloc[-1]
+            ema50 = self._get("ema50").iloc[-1] if "ema50" in self.indicators else tlb.EMA(df[target_col], timeperiod=50).iloc[-1]
+
+            # Trend confirmation
+            trend = "bullish" if last_price > ema50 else "bearish"
+            signal = "pullback"  # uniform naming
+
+            # Volume spike
+            vol_spike = df["Volume"].iloc[-1] > 1.5 * df["Volume"].rolling(20).mean().iloc[-1] if "Volume" in df.columns else False
+
+            # Confidence: inverse distance to nearest level normalized by ATR
+            confidence = float(np.clip(1 - abs(last_price - nearest_level_value) / atr, 0.0, 1.0))
+
+            # Risk management: realistic SL/TP
+            stop_loss = last_price - 1.5 * atr if trend == "bullish" else last_price + 1.5 * atr
+            take_profit = last_price + 3 * atr if trend == "bullish" else last_price - 3 * atr
+
+            return self._format(
+                strategy="fibonacci_pullback",
+                signal=signal,
+                confidence=confidence,
+                reasons=[f"Nearest Fibonacci: {nearest_level_key}"],
+                entry=last_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trend=trend,
+                volume_spike=vol_spike,
+            )
+
+        except Exception as e:
+            return self._format(
+                strategy="fibonacci_pullback",
+                signal="error",
+                confidence=0.0,
+                reasons=[f"Error in Fibonacci pullback detection: {e}"],
+                entry=None,
+                stop_loss=None,
+                take_profit=None,
+                trend=None,
+                volume_spike=None,
+            )
+
+    # ----------------------
+    # Volume Spike Strategy
+    # ----------------------
+    def detect_volume_spike(self, df: pd.DataFrame):
+        avg_vol = df['Volume'].rolling(20).mean().iloc[-1]
+        last_vol = df['Volume'].iloc[-1]
+        last_price = df['Close'].iloc[-1]
+
+        signal = 'none'
+        confidence = 0.0
+        stop_loss = take_profit = None
+
+        vol_spike = last_vol > 1.5 * avg_vol
+        if vol_spike:
+            signal = 'volume_spike'
+            confidence = round((last_vol - avg_vol)/avg_vol, 2)
+            atr = self._get('atr14').iloc[-1] if self._get('atr14') is not None else (last_price*0.01)
+            stop_loss = last_price - atr
+            take_profit = last_price + 2*atr
+
+        trend = 'bullish' if self._get('ema20').iloc[-1] > self._get('ema50').iloc[-1] else 'bearish'
+
+        return self._format("volume_spike", signal, confidence, reasons=["Volume spike detected"] if vol_spike else [], 
+                            entry=last_price, stop_loss=stop_loss, take_profit=take_profit, trend=trend, volume_spike=vol_spike)
+
+    # ----------------------
+    # RSI Strategy
+    # ----------------------
+    def detect_rsi_strategy(self, df: pd.DataFrame):
+        last_price = df['Close'].iloc[-1]
+        rsi = tlb.RSI(df['Close'], timeperiod=14).iloc[-1]
+        atr = self._get('atr14').iloc[-1] if self._get('atr14') is not None else (last_price*0.01)
+
+        signal = 'none'
+        confidence = 0.0
+        stop_loss = take_profit = None
+        reasons = []
+
+        if rsi > 70:
+            signal = 'overbought'
+            confidence = round((rsi-70)/30, 2)
+            stop_loss = last_price + atr
+            take_profit = last_price - 2*atr
+            reasons.append("RSI overbought")
+        elif rsi < 30:
+            signal = 'oversold'
+            confidence = round((30-rsi)/30, 2)
+            stop_loss = last_price - atr
+            take_profit = last_price + 2*atr
+            reasons.append("RSI oversold")
+
+        trend = 'bullish' if self._get('ema20').iloc[-1] > self._get('ema50').iloc[-1] else 'bearish'
+        vol_spike = df['Volume'].iloc[-1] > 1.5 * df['Volume'].rolling(20).mean().iloc[-1]
+
+        return self._format("rsi", signal, confidence, reasons, entry=last_price, stop_loss=stop_loss, 
+                            take_profit=take_profit, trend=trend, volume_spike=vol_spike)
+
+    # ----------------------
+    # MACD Strategy
+    # ----------------------
+    def detect_macd_strategy(self, df: pd.DataFrame):
+        last_price = df['Close'].iloc[-1]
+        macd, signal_line, _ = tlb.MACD(df['Close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        macd_last = macd.iloc[-1]
+        signal_last = signal_line.iloc[-1]
+        atr = self._get('atr14').iloc[-1] if self._get('atr14') is not None else (last_price*0.01)
+
+        signal = 'none'
+        confidence = 0.0
+        stop_loss = take_profit = None
+        reasons = []
+
+        if macd_last > signal_last:
+            signal = 'bull_macd'
+            confidence = round((macd_last - signal_last)/abs(signal_last+1e-12), 2)
+            stop_loss = last_price - atr
+            take_profit = last_price + 2*atr
+            reasons.append("MACD bullish crossover")
+        elif macd_last < signal_last:
+            signal = 'bear_macd'
+            confidence = round((signal_last - macd_last)/abs(signal_last+1e-12), 2)
+            stop_loss = last_price + atr
+            take_profit = last_price - 2*atr
+            reasons.append("MACD bearish crossover")
+
+        trend = 'bullish' if self._get('ema20').iloc[-1] > self._get('ema50').iloc[-1] else 'bearish'
+        vol_spike = df['Volume'].iloc[-1] > 1.5 * df['Volume'].rolling(20).mean().iloc[-1]
+
+        return self._format("macd", signal, confidence, reasons, entry=last_price, stop_loss=stop_loss, 
+                            take_profit=take_profit, trend=trend, volume_spike=vol_spike)
+
+    # ----------------------
+    # Bollinger Strategy
+    # ----------------------
+    def detect_bollinger_strategy(self, df: pd.DataFrame):
+        last_price = df['Close'].iloc[-1]
+        bb_upper, bb_middle, bb_lower = tlb.BBANDS(df['Close'], timeperiod=20, nbdevup=2, nbdevdn=2)
+        atr = self._get('atr14').iloc[-1] if self._get('atr14') is not None else (last_price*0.01)
+
+        signal = 'none'
+        confidence = 0.0
+        stop_loss = take_profit = None
+        reasons = []
+
+        if last_price > bb_upper.iloc[-1]:
+            signal = 'sell_bb'
+            confidence = round((last_price - bb_upper.iloc[-1])/bb_upper.iloc[-1], 2)
+            stop_loss = last_price + atr
+            take_profit = last_price - 2*atr
+            reasons.append("Price above BB upper")
+        elif last_price < bb_lower.iloc[-1]:
+            signal = 'buy_bb'
+            confidence = round((bb_lower.iloc[-1] - last_price)/bb_lower.iloc[-1], 2)
+            stop_loss = last_price - atr
+            take_profit = last_price + 2*atr
+            reasons.append("Price below BB lower")
+
+        trend = 'bullish' if self._get('ema20').iloc[-1] > self._get('ema50').iloc[-1] else 'bearish'
+        vol_spike = df['Volume'].iloc[-1] > 1.5 * df['Volume'].rolling(20).mean().iloc[-1]
+
+        return self._format("bollinger", signal, confidence, reasons, entry=last_price, stop_loss=stop_loss,
+                            take_profit=take_profit, trend=trend, volume_spike=vol_spike)
+
+    # ----------------------
+    # Pro Ad-Ons
+    # ----------------------
+    def detect_extra_strategies(self, df: pd.DataFrame):
+        """Calculates all pro strategies with full multi-condition analysis."""
+        close_last = df["Close"].iat[-1]
+        last_vol = df["Volume"].iat[-1]
+        avg_vol = df["Volume"].rolling(20).mean().iat[-1]
+        atr = self._get('atr14').iloc[-1] if self._get('atr14') is not None else (close_last*0.01)
+        trend = 'bullish' if self._get('ema20').iloc[-1] > self._get('ema50').iloc[-1] else 'bearish'
+        vol_spike = last_vol > 1.5 * avg_vol
+
+        # ---------------- TREND STRATEGIES ---------------- #
+        try:
+            ichi = ta.trend.IchimokuIndicator(df["High"], df["Low"], window1=9, window2=26, window3=52)
+            ichi_a = ichi.ichimoku_a().iat[-1]
+            ichi_b = ichi.ichimoku_b().iat[-1]
+            if close_last > ichi_a and close_last > ichi_b:
+                signal, reasons = "bullish", ["above ichimoku cloud"]
+            elif close_last < ichi_a and close_last < ichi_b:
+                signal, reasons = "bearish", ["below ichimoku cloud"]
+            else:
+                signal, reasons = "neutral", ["inside ichimoku cloud"]
+
+            self.strategies["ichimoku"] = self._format("ichimoku", signal, confidence=0.8 if signal!="neutral" else 0.0,
+                                                    reasons=reasons, entry=close_last,
+                                                    stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                    take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                    trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["ichimoku"] = None
+
+        try:
+            psar = ta.trend.PSARIndicator(df["High"], df["Low"], df["Close"])
+            psar_val = psar.psar().iat[-1]
+            signal = "bullish" if close_last > psar_val else "bearish"
+            reasons = ["PSAR trend"]
+            self.strategies["psar_trend"] = self._format("psar_trend", signal, confidence=0.8,
+                                                        reasons=reasons, entry=close_last,
+                                                        stop_loss=close_last-atr if signal=="bullish" else close_last+atr,
+                                                        take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr,
+                                                        trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["psar_trend"] = None
+
+        try:
+            kama = ta.momentum.KAMAIndicator(df["Close"]).kama()
+            slope = np.sign(kama.diff().iat[-1])
+            signal = "bullish" if slope>0 else "bearish" if slope<0 else "neutral"
+            reasons = ["KAMA slope"]
+            self.strategies["kama_slope"] = self._format("kama_slope", signal, confidence=0.7 if signal!="neutral" else 0.0,
+                                                        reasons=reasons, entry=close_last,
+                                                        stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                        take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                        trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["kama_slope"] = None
+
+        try:
+            trix = ta.trend.TRIXIndicator(df["Close"]).trix()
+            slope = np.sign(trix.diff().iat[-1])
+            signal = "bullish" if slope>0 else "bearish" if slope<0 else "neutral"
+            reasons = ["TRIX momentum"]
+            self.strategies["trix_momentum"] = self._format("trix_momentum", signal, confidence=0.7 if signal!="neutral" else 0.0,
+                                                            reasons=reasons, entry=close_last,
+                                                            stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                            take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                            trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["trix_momentum"] = None
+
+        # ---------------- VOLUME STRATEGIES ---------------- #
+        volume_indicators = {
+            "obv": ta.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"]).on_balance_volume(),
+            "cmf": ta.volume.ChaikinMoneyFlowIndicator(df["High"], df["Low"], df["Close"], df["Volume"]).chaikin_money_flow(),
+            "mfi": ta.volume.MFIIndicator(df["High"], df["Low"], df["Close"], df["Volume"]).money_flow_index(),
+            "eom": ta.volume.EaseOfMovementIndicator(df["High"], df["Low"], df["Volume"]).ease_of_movement(),
+            "force_index": ta.volume.ForceIndexIndicator(df["Close"], df["Volume"]).force_index(),
+            "adl": ta.volume.AccDistIndexIndicator(df["High"], df["Low"], df["Close"], df["Volume"]).acc_dist_index(),
+            "vpt": ta.volume.VolumePriceTrendIndicator(df["Close"], df["Volume"]).volume_price_trend()
+        }
+
+        for key, series in volume_indicators.items():
+            try:
+                val = series.iat[-1]
+                slope = np.sign(series.diff().iat[-1]) if key not in ["cmf","mfi","eom","force_index"] else 0
+                signal = "bullish" if slope>0 or val>0 else "bearish" if slope<0 or val<0 else "neutral"
+                reasons = [f"{key} signal"]
+                self.strategies[key] = self._format(key, signal, confidence=0.7 if signal!="neutral" else 0.0,
+                                                    reasons=reasons, entry=close_last,
+                                                    stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                    take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                    trend=trend, volume_spike=vol_spike)
+            except Exception:
+                self.strategies[key] = None
+
+        # ---------------- VOLATILITY STRATEGIES ---------------- #
+        volatility_indicators = {
+            "keltner": ta.volatility.KeltnerChannel(df["High"], df["Low"], df["Close"]),
+            "donchian": ta.volatility.DonchianChannel(df["High"], df["Low"], df["Close"])
+        }
+
+        for key, indicator in volatility_indicators.items():
+            try:
+                upper = indicator.keltner_channel_hband().iat[-1] if key=="keltner" else indicator.donchian_channel_hband().iat[-1]
+                lower = indicator.keltner_channel_lband().iat[-1] if key=="keltner" else indicator.donchian_channel_lband().iat[-1]
+                signal = "bullish" if close_last>upper else "bearish" if close_last<lower else "neutral"
+                reasons = [f"{key} breakout"]
+                self.strategies[key] = self._format(key, signal, confidence=0.8 if signal!="neutral" else 0.0,
+                                                    reasons=reasons, entry=close_last,
+                                                    stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                    take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                    trend=trend, volume_spike=vol_spike)
+            except Exception:
+                self.strategies[key] = None
+
+        # ---------------- SUPER TREND ---------------- #
+        try:
+            atr_series = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"]).average_true_range()
+            factor = 3.0
+            hl2 = (df["High"] + df["Low"])/2
+            supertrend = hl2 - factor * atr_series
+            signal = "bullish" if close_last > supertrend.iat[-1] else "bearish"
+            reasons = ["supertrend breakout"]
+            self.strategies["supertrend"] = self._format("supertrend", signal, confidence=0.8,
+                                                        reasons=reasons, entry=close_last,
+                                                        stop_loss=close_last-atr if signal=="bullish" else close_last+atr,
+                                                        take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr,
+                                                        trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["supertrend"] = None
+
+        # ---------------- HULL MA ---------------- #
+        try:
+            def hull_moving_average(series, window=14):
+                half_length = int(window/2)
+                sqrt_length = int(np.sqrt(window))
+                wma = series.rolling(window, min_periods=1).mean()
+                wma_half = series.rolling(half_length, min_periods=1).mean()
+                raw_hma = (2*wma_half - wma).rolling(sqrt_length, min_periods=1).mean()
+                return raw_hma
+
+            hma = hull_moving_average(df["Close"], 20)
+            slope = np.sign(hma.diff().iat[-1])
+            signal = "bullish" if slope>0 else "bearish" if slope<0 else "neutral"
+            reasons = ["HMA slope"]
+            self.strategies["hma"] = self._format("hma", signal, confidence=0.7 if signal!="neutral" else 0.0,
+                                                reasons=reasons, entry=close_last,
+                                                stop_loss=close_last-atr if signal=="bullish" else close_last+atr if signal=="bearish" else None,
+                                                take_profit=close_last+2*atr if signal=="bullish" else close_last-2*atr if signal=="bearish" else None,
+                                                trend=trend, volume_spike=vol_spike)
+        except Exception:
+            self.strategies["hma"] = None
+
+
+    def strategies_generator(self, df: pd.DataFrame, cfg: CLIConfig, target_name: str = 'Close'):
+        target_df = df.copy()
+        self.strategies["breakout"] = self.detect_breakout(target_df, target_col=target_name)
+        # Mean reversion
+        self.strategies["mean_reversion"] = self.detect_mean_reversion(target_df, target_col=target_name)
+        # Fibonacci
+        self.strategies["fibonacci"] = self.detect_fibonacci_pullback(target_df, target_col=target_name)
+        # Price action
+        self.strategies["price_action"] = self.detect_price_action(target_df)
+        # Swing trade
+        self.strategies["swing"] = self.detect_swing_trade(target_df, target_col=target_name)
+        # Scalping helper (advisory)
+        self.strategies["scalping_helper"] = self.detect_scalping_opportunity(target_df, target_col=target_name)
+        # Market regime
+        self.strategies["regime"] = self.detect_market_regime(target_df)
+        # Options summary (light)
+        self.strategies["options_summary"] = self.fetch_options_flow_stub(cfg.ticker) if hasattr(cfg, 'ticker') else {}
+        # Trend strength
+        self.strategies["trend_strength"] = self.detect_trend_strength(target_df) if hasattr(cfg, 'ticker') else None
+        # Volume spike
+        self.strategies["volume_spike"] = self.detect_volume_spike(target_df) if hasattr(cfg, 'ticker') else None
+        # MACD strategy
+        self.strategies["macd_strategy"] = self.detect_macd_strategy(target_df) if hasattr(cfg, 'ticker') else None
+        # Bollinger strategy
+        self.strategies["bollinger_strategy"] = self.detect_bollinger_strategy(target_df) if hasattr(cfg, 'ticker') else None
+        # Extra pro indicators
+        self.detect_extra_strategies(target_df)
+    
+    # ----------------------
+    # Function Call
+    # ----------------------
+    def detect_all_strategies(self, df: pd.DataFrame, cfg: CLIConfig, target_name: str = 'Close'):
+        if console and not cfg.quiet:
+            with Progress(SpinnerOrTickColumn(), TextColumn("[progress.description]{task.description}")) as prog:
+                t = prog.add_task("Initiating strategies engineer...", total=None)
+                try:
+                    self.strategies_generator(df, cfg, target_name)
+                    prog.stop_task(t)
+                    prog.update(t, description=f"Engineered 30+ strategies.")
+                    return self.strategies
+                except Exception as e:
+                    prog.stop()
+                    logger.error(f"Failed to detect strategies: {e}")
+                    raise
+        else:
+            self.strategies_generator(df, cfg, target_name)
+            return self.strategies
+
 class TradingSignalEngineer:
     """Production-grade trading signal generator using multiple strategies."""
 
@@ -2764,7 +3869,6 @@ class StockForecasterCLI:
         self.feature_engieer = FeatureEngineer()
         self.PERIOD_FOR_INTERVAL = PERIOD_FOR_INTERVAL
         self.output_engineer = OutputManager()
-        self.strategies_engineer = StrategiesEngineer()
         self.strategies_aggregator = MLSignalAggregator()
 
     def run_predict(self,
@@ -2821,12 +3925,12 @@ class StockForecasterCLI:
         # if console and not quiet:
         #     console.print(f"[green]Saved JSON →[/green] {json_path}")
         #     console.print(f"[green]Saved PLOT →[/green] {plot_path}")
-        strategies = self.strategies_engineer.detect_all_strategies(df, cfg)
+        strategies = StrategiesEngineerPro(df).detect_all_strategies(df, cfg)
+        with open('dump.json', "w") as f:
+            json.dump(strategies, f, indent=4, cls=NumpyEncoder)
         flattend_json = self.strategies_aggregator.generate(strategies, )
         with open('flatten_dump.json', "w") as f:
             json.dump(flattend_json, f, indent=4, cls=NumpyEncoder)
-        with open('dump.json', "w") as f:
-            json.dump(strategies, f, indent=4, cls=NumpyEncoder)
         
 
         # Timing

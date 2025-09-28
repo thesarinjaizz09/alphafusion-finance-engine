@@ -1,62 +1,92 @@
 {
     "breakout": {
+        "strategy": "breakout",
         "signal": "none",
         "confidence": 0.0,
-        "reason": "No resistance/support band breakout",
-        "volume_spike": false,
+        "reasons": [
+            "No breakout detected"
+        ],
+        "entry": 247.17999267578125,
         "stop_loss": null,
-        "take_profit": null
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "mean_reversion": {
+        "strategy": "mean_reversion",
         "signal": "none",
         "confidence": 0.0,
         "reasons": [],
-        "volume_spike": false,
-        "stop_loss": 236.56554492052052,
-        "take_profit": 240.76449966430664
+        "entry": 247.17999267578125,
+        "stop_loss": null,
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "fibonacci": {
-        "levels": {
-            "0.236": 236.8312716064453,
-            "0.382": 223.10435321044923,
-            "0.5": 212.00999450683594,
-            "0.618": 200.91563580322264,
-            "0.786": 185.12027764892576
-        },
-        "near_level": "0.236",
-        "distance": 18.628735107421875,
-        "atr": 5.060449496868613,
-        "trend": "bullish"
+        "strategy": "fibonacci_pullback",
+        "signal": "pullback",
+        "confidence": 0.0,
+        "reasons": [
+            "Nearest Fibonacci: 0.236"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 239.2450169519826,
+        "take_profit": 263.04994412337857,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "price_action": {
-        "bullish_engulfing": false,
-        "bearish_engulfing": false,
-        "pin_bar": false,
-        "volume_confirmation": false,
-        "confidence": 0.36
+        "strategy": "price_action",
+        "signal": "pin_bar",
+        "confidence": 0.17,
+        "reasons": [
+            "pin_bar"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 250.1199951171875,
+        "take_profit": 241.29998779296875,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "swing": {
+        "strategy": "swing_trade",
         "signal": "none",
-        "reasons": [],
         "confidence": 0.0,
+        "reasons": [],
+        "entry": null,
         "stop_loss": null,
-        "take_profit": null
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "scalping_helper": {
+        "strategy": "scalping_opportunity",
         "signal": "none",
-        "confidence": 0,
-        "reason": null
+        "confidence": 0.0,
+        "reasons": [
+            "No valid setup"
+        ],
+        "entry": null,
+        "stop_loss": null,
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "regime": {
-        "volatility": "medium_volatility",
-        "reason": "Trending regime with controlled volatility",
-        "signal": "bullish",
-        "vol_spike": false,
-        "confidence": 0.63,
-        "stop_loss": 248.01157155400696,
-        "take_profit": 270.35687703358764
+        "strategy": "market_regime",
+        "signal": "high_volatility",
+        "confidence": 0.5330297507010313,
+        "reasons": [
+            "Explosive volatility regime"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 239.2450169519826,
+        "take_profit": 263.04994412337857,
+        "trend": "bullish",
+        "volume_spike": false
     },
-    "options": {
+    "options_summary": {
         "expiries": [
             "2025-10-03",
             "2025-10-10",
@@ -70,9 +100,7 @@
             "2026-02-20",
             "2026-03-20",
             "2026-04-17",
-            "2026-05-15",
             "2026-06-18",
-            "2026-08-21",
             "2026-09-18",
             "2026-12-18",
             "2027-01-15",
@@ -80,131 +108,250 @@
             "2027-12-17",
             "2028-01-21"
         ],
-        "calls_oi_sum": 181273,
-        "puts_oi_sum": 83632
+        "calls_oi_sum": 38917,
+        "puts_oi_sum": 24281
     },
-    "news_sentiment": null,
     "trend_strength": {
+        "strategy": "trend_strength",
         "signal": "bull_trend",
-        "confidence": 0.07
+        "confidence": 0.12011951592424952,
+        "reasons": [
+            "EMA10 > EMA50"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 239.2450169519826,
+        "take_profit": 263.04994412337857,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "volume_spike": {
+        "strategy": "volume_spike",
         "signal": "none",
         "confidence": 0.0,
-        "last_volume": 46045700,
-        "avg_volume": 61354610.0
+        "reasons": [],
+        "entry": 247.17999267578125,
+        "stop_loss": null,
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "macd_strategy": {
-        "signal": "bull_macd",
-        "confidence": 0.25
+        "strategy": "macd",
+        "signal": "bear_macd",
+        "confidence": 0.11,
+        "reasons": [
+            "MACD bearish crossover"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 252.46997649164703,
+        "take_profit": 236.60002504404972,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "bollinger_strategy": {
+        "strategy": "bollinger",
         "signal": "none",
-        "confidence": 0.0
+        "confidence": 0.0,
+        "reasons": [],
+        "entry": 247.17999267578125,
+        "stop_loss": null,
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "ichimoku": {
+        "strategy": "ichimoku",
         "signal": "bullish",
-        "reason": "above ichimoku cloud"
+        "confidence": 0.8,
+        "reasons": [
+            "above ichimoku cloud"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "psar_trend": {
-        "signal": "bullish",
-        "psar_value": 235.557691245708
+        "strategy": "psar_trend",
+        "signal": "bearish",
+        "confidence": 0.8,
+        "reasons": [
+            "PSAR trend"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 252.46997649164703,
+        "take_profit": 236.60002504404972,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "kama_slope": {
-        "signal": "bullish",
-        "value": 247.52366089842212
+        "strategy": "kama_slope",
+        "signal": "bearish",
+        "confidence": 0.7,
+        "reasons": [
+            "KAMA slope"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 252.46997649164703,
+        "take_profit": 236.60002504404972,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "trix_momentum": {
-        "signal": "bullish",
-        "value": 0.36647235679916473
+        "strategy": "trix_momentum",
+        "signal": "bearish",
+        "confidence": 0.7,
+        "reasons": [
+            "TRIX momentum"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 252.46997649164703,
+        "take_profit": 236.60002504404972,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "obv": {
-        "signal": "bearish",
-        "value": 2263694600.0
+        "strategy": "obv",
+        "signal": "bullish",
+        "confidence": 0.7,
+        "reasons": [
+            "obv signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "cmf": {
+        "strategy": "cmf",
         "signal": "bullish",
-        "value": 0.1998216541269734
+        "confidence": 0.7,
+        "reasons": [
+            "cmf signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "mfi": {
+        "strategy": "mfi",
         "signal": "bullish",
-        "value": 75.10857231533367
+        "confidence": 0.7,
+        "reasons": [
+            "mfi signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "eom": {
+        "strategy": "eom",
         "signal": "bullish",
-        "value": 10.370088870253788
+        "confidence": 0.7,
+        "reasons": [
+            "eom signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "force_index": {
+        "strategy": "force_index",
         "signal": "bullish",
-        "value": 178083111.58578125
+        "confidence": 0.7,
+        "reasons": [
+            "force_index signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "adl": {
-        "signal": "bearish",
-        "value": 841422329.0579833
+        "strategy": "adl",
+        "signal": "bullish",
+        "confidence": 0.7,
+        "reasons": [
+            "adl signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "vpt": {
-        "signal": "bearish",
-        "value": 48706049.1229987
+        "strategy": "vpt",
+        "signal": "bullish",
+        "confidence": 0.7,
+        "reasons": [
+            "vpt signal"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "keltner": {
+        "strategy": "keltner",
         "signal": "bullish",
-        "upper": 244.94816970825195,
-        "lower": 236.07916488647462,
-        "close": 255.4600067138672
+        "confidence": 0.8,
+        "reasons": [
+            "keltner breakout"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "donchian": {
+        "strategy": "donchian",
         "signal": "neutral",
-        "upper": 257.6000061035156,
-        "lower": 225.9499969482422,
-        "close": 255.4600067138672
-    },
-    "stoch_rsi": {
-        "value": 0.8029365782812299,
-        "signal": "bullish"
-    },
-    "ultimate_osc": {
-        "value": 63.88368968862981,
-        "signal": "bullish"
-    },
-    "awesome_osc": {
-        "value": 18.37714969410615,
-        "signal": "bullish"
-    },
-    "tsi": {
-        "value": 35.36450231718013,
-        "signal": "bullish"
-    },
-    "cci": {
-        "value": 136.87527126396927,
-        "signal": "bullish"
-    },
-    "williams_r": {
-        "value": -6.761449512225107,
-        "signal": "bearish"
-    },
-    "roc": {
-        "value": 12.641657161461461,
-        "signal": "bullish"
-    },
-    "adx": {
-        "value": 30.63006554521556,
-        "signal": "bullish"
-    },
-    "adx_pos": {
-        "value": 38.15877896964103,
-        "signal": "bullish"
-    },
-    "adx_neg": {
-        "value": 14.88017984788111,
-        "signal": "bullish"
+        "confidence": 0.0,
+        "reasons": [
+            "donchian breakout"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": null,
+        "take_profit": null,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "supertrend": {
+        "strategy": "supertrend",
         "signal": "bullish",
-        "value": 240.5086539508003,
-        "close": 255.4600067138672
+        "confidence": 0.8,
+        "reasons": [
+            "supertrend breakout"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 241.89000885991547,
+        "take_profit": 257.7599603075128,
+        "trend": "bullish",
+        "volume_spike": false
     },
     "hma": {
-        "signal": "bullish",
-        "value": 248.346746635437
+        "strategy": "hma",
+        "signal": "bearish",
+        "confidence": 0.7,
+        "reasons": [
+            "HMA slope"
+        ],
+        "entry": 247.17999267578125,
+        "stop_loss": 252.46997649164703,
+        "take_profit": 236.60002504404972,
+        "trend": "bullish",
+        "volume_spike": false
     }
 }
