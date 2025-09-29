@@ -14,16 +14,20 @@ import torch
 import requests
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-import matplotlib.pyplot as plt
+
+# Load environment variables
+load_dotenv()
 
 # --------------------------
 # CONFIG
 # --------------------------
-NEWSAPI_KEY = "0869389d62ae468d8f199910cff283f2"       # https://newsapi.org
-FINNHUB_KEY = "d3dgkc9r01qg5k5rhbbgd3dgkc9r01qg5k5rhbc0"       # https://finnhub.io
-SENTIMENT_MODEL = "ProsusAI/finbert"   # Finance-tuned NLP model
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")       # https://newsapi.org
+FINNHUB_KEY = os.getenv("FINNHUB_KEY")       # https://finnhub.io
+SENTIMENT_MODEL = os.getenv("SENTIMENT_MODEL")  # Finance-tuned NLP model
 DAYS_BACK = 30
 
 
