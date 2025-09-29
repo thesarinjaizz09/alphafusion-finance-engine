@@ -137,7 +137,7 @@ def fetch_price_data(ticker: str, days_back: int = DAYS_BACK) -> pd.DataFrame:
 # --------------------------
 # Merge & Fusion
 # --------------------------
-def merge_sentiments(newsapi_df: pd.DataFrame) -> pd.DataFrame:
+def merge_sentiments(newsapi_df: pd.DataFrame, finnhub_df: pd.DataFrame) -> pd.DataFrame:
     """Merge NewsAPI + Finnhub sentiment into a hybrid score"""
     if newsapi_df.empty and finnhub_df.empty:
         return pd.DataFrame()
@@ -145,13 +145,16 @@ def merge_sentiments(newsapi_df: pd.DataFrame) -> pd.DataFrame:
     # Weighted average: NewsAPI (FinBERT) = 0.6, Finnhub = 0.4
     if not newsapi_df.empty:
         newsapi_df["source"] = "newsapi"
+    if not finnhub_df.empty:
+        finnhub_df["source"] = "finnhub"
 
-    merged = pd.concat([newsapi_df], ignore_index=True, sort=False)
+    merged = pd.concat([newsapi_df, finnhub_df], ignore_index=True, sort=False)
 
     # Daily hybrid score
     daily = (
         merged.groupby("date")["sentiment"]
-        .apply(lambda x: 1 * x[x.index.isin(newsapi_df.index)].mean()
+        .apply(lambda x: 0.6 * x[x.index.isin(newsapi_df.index)].mean() +
+                         0.4 * x[x.index.isin(finnhub_df.index)].mean()
               if not x.empty else 0)
         .reset_index()
     )
@@ -191,14 +194,13 @@ def run_hybrid_analysis(ticker: str):
 
     # Fetch news
     newsapi_raw = fetch_newsapi(ticker)
-    newsapi_raw.to_csv('news.csv')
-    # finnhub_raw = fetch_finnhub(ticker)
+    finnhub_raw = fetch_finnhub(ticker)
 
     # Process NewsAPI (FinBERT sentiment)
     newsapi_sent = analyze_sentiment_newsapi(newsapi_raw)
 
     # Merge hybrid
-    sent_df = merge_sentiments(newsapi_sent)
+    sent_df = merge_sentiments(newsapi_sent, finnhub_raw)
 
     if sent_df.empty:
         print("⚠️ No sentiment data found.")
